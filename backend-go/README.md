@@ -76,10 +76,21 @@ helper-call ABI above and the Effect thunk model (`EffectBind` → sequenced
   Let/LetRec/EffectBind/EffectPure/EffectDefer/Branch/PrimOp/PrimEffect/
   PrimUndefined/Fail/Uncurried{,Effect}{Abs,App}`.
 - ⬜ Still `_todo`: `Update` (record update) — no corpus test hits it yet.
-- ⬜ Stage 2a proper: emit native Go multi-arg funcs from multi-arg `Abs`/
-  `UncurriedAbs` (curried unary `Abs` desugar still in place = Phase 1 semantics).
-  This is where the optimizer's uncurrying turns into an actual Go-level win.
-- ⬜ Benchmark vs the `main` (Phase 1) oracle + JS, to quantify the IR's gains.
+- ❌ ~~Stage 2a: native Go multi-arg from ordinary `Abs`/`App`~~ — **abandoned
+  after reading the references.** Neither reference consumer does this: backend-es
+  emits `esCurriedFunction` + a folded one-arg `EsCall` spine
+  (`Codegen/EcmaScript/Convert.purs`), purescm emits `mkCurriedFn`/`runCurriedFn`
+  (nested unary lambdas). Both reserve native multi-arg for `Uncurried*` only —
+  which we already do. The optimizer's `App f args` is a *syntactic spine*, not a
+  saturation guarantee (f may be partial/over-applied), so a native `f(a,b,c)`
+  would be unsound on a strict-arity target like Go. **We have already banked every
+  cheap uncurrying win the IR offers.**
+- ⬜ Real perf levers from here, in priority order: (1) **TCO** — backend-es's
+  `TcoExpr` analysis + join points + dispatch-loop codegen; we have none (Phase 1
+  leaned on Go's growable goroutine stack). (2) A codegen-side **inline table**
+  (`inlineApp` analog) for known saturated builtins.
+- ⬜ Benchmark vs the `main` (Phase 1) oracle + JS first, to target the lever with
+  data rather than assumption.
 - ⬜ Whole-program build currently compiles all ~200 modules into one package;
   a per-entry prune (cf Phase 1 `--entry`) would speed `go build`.
 

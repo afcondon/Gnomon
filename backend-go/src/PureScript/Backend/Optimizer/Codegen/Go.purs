@@ -11,9 +11,17 @@
 -- |   * Curried `any` runtime retained. A multi-arg `Abs [p1..pn] body` is
 -- |     emitted as nested unary closures and `App f [a1..an]` as nested unary
 -- |     applications -- i.e. exactly Phase 1 semantics. This is always correct
--- |     regardless of whether an application is saturated. Emitting native Go
--- |     multi-arg functions (the real Stage 2a uncurrying win) is the next step,
--- |     gated on the conformance corpus.
+-- |     regardless of whether an application is saturated, and it is what BOTH
+-- |     reference consumers do: backend-es emits `esCurriedFunction` / a folded
+-- |     `EsCall hd [oneArg]` spine (Codegen/EcmaScript/Convert.purs), and purescm
+-- |     emits `mkCurriedFn` / `runCurriedFn` = nested unary lambdas. Native
+-- |     multi-arg is reserved for the `Uncurried*` (Fn/EffectFn) nodes below --
+-- |     which we already emit natively. There is NO safe "emit native n-ary from
+-- |     ordinary Abs/App" win: the optimizer's `App f args` is a syntactic spine,
+-- |     not a saturation guarantee (f may be partially/over-applied), so a native
+-- |     `f(a,b,c)` would be unsound. The real perf levers from here are TCO
+-- |     (backend-es's TcoExpr/join-point/dispatch-loop layer; we have none) and a
+-- |     codegen-side inline table for known saturated builtins.
 -- |   * PrimOps ARE lowered to native Go operators with type assertions -- that
 -- |     win comes for free from the IR and needs no runtime dict.
 -- |   * Effect is special-cased (EffectBind/Pure/Defer) into Go thunks.
