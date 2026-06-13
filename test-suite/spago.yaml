@@ -1,0 +1,33 @@
+# Cross-backend differential test suite for purescript-go (psgo).
+#
+# Copied from the Jurist (Julia) corpus so the SAME Test.* modules run on
+# JS (reference semantics) and Go. No `backend:` section — this workspace
+# builds normal JS output, and run_tests.py drives `purs --codegen corefn,js`
+# so the same build also emits CoreFn that psgo consumes.
+package:
+  name: psgo-tests
+  dependencies:
+    - arrays
+    - console
+    - control
+    - effect
+    - either
+    - enums
+    - foldable-traversable
+    - functions
+    - integers
+    - lists
+    - maybe
+    - newtype
+    - numbers
+    - partial
+    - prelude
+    - refs
+    - st
+    - strings
+    - tailrec
+    - tuples
+    - unfoldable
+workspace:
+  packageSet:
+    registry: 57.1.0

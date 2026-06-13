@@ -1,0 +1,27 @@
+resolver: lts-20.9
+pvp-bounds: both
+packages:
+  - .
+ghc-options:
+  "$locals": -O0
+extra-deps:
+  - language-javascript-0.7.0.0
+  - github: purescript/purescript
+    commit: v0.15.14
+  - process-1.6.13.1
+  - Cabal-3.6.3.0
+  - protolude-0.3.1
+  - hspec-2.10.9
+  - hspec-core-2.10.9
+  - hspec-discover-2.10.9
+
+flags:
+  aeson-pretty:
+    lib-only: true
+  these:
+    assoc: false
+  haskeline:
+    terminfo: false
+    examples: false
+  cryptonite:
+    use_target_attributes: false

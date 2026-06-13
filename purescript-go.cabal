@@ -1,0 +1,118 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.38.1.
+--
+-- see: https://github.com/sol/hpack
+
+name:           purescript-go
+version:        0.0.1
+synopsis:       PureScript Programming Language Go Back-end (spike)
+description:    Go backend for PureScript. Consumes CoreFn JSON (purs --codegen corefn) and emits Go source via a statement-form Go AST + pretty-printer + gofmt post-pass. Third turn of the purerl -> Julia -> Python backend genealogy; reaches back to grandparent purerl for the statement-oriented AST/Pretty machinery.
+category:       Language
+stability:      experimental
+homepage:       https://github.com/afcondon/purescript-go#readme
+bug-reports:    https://github.com/afcondon/purescript-go/issues
+author:         Andrew Condon
+maintainer:     Andrew Condon
+copyright:      (c) 2026 Andrew Condon
+license:        BSD3
+build-type:     Simple
+
+source-repository head
+  type: git
+  location: https://github.com/afcondon/purescript-go
+
+library
+  exposed-modules:
+      Language.PureScript.Go.CodeGen
+      Language.PureScript.Go.CodeGen.AST
+      Language.PureScript.Go.CodeGen.Common
+      Language.PureScript.Go.CodeGen.Pretty
+      Language.PureScript.Go.Foreigns
+      Language.PureScript.Go.Make
+  other-modules:
+      Paths_purescript_go
+  hs-source-dirs:
+      src
+  default-extensions:
+      ConstraintKinds
+      DataKinds
+      DeriveFunctor
+      DeriveFoldable
+      DeriveTraversable
+      DeriveGeneric
+      DerivingStrategies
+      EmptyDataDecls
+      FlexibleContexts
+      KindSignatures
+      LambdaCase
+      MultiParamTypeClasses
+      NoImplicitPrelude
+      PatternGuards
+      PatternSynonyms
+      RankNTypes
+      RecordWildCards
+      OverloadedStrings
+      ScopedTypeVariables
+      TupleSections
+      ViewPatterns
+  ghc-options: -Wall -O0
+  build-depends:
+      Glob
+    , aeson
+    , base
+    , containers
+    , directory
+    , file-embed
+    , filepath
+    , mtl
+    , process
+    , purescript
+    , text
+    , transformers
+  default-language: Haskell2010
+
+executable psgo
+  main-is: Main.hs
+  other-modules:
+      Paths_purescript_go
+  hs-source-dirs:
+      app
+  default-extensions:
+      ConstraintKinds
+      DataKinds
+      DeriveFunctor
+      DeriveFoldable
+      DeriveTraversable
+      DeriveGeneric
+      DerivingStrategies
+      EmptyDataDecls
+      FlexibleContexts
+      KindSignatures
+      LambdaCase
+      MultiParamTypeClasses
+      NoImplicitPrelude
+      PatternGuards
+      PatternSynonyms
+      RankNTypes
+      RecordWildCards
+      OverloadedStrings
+      ScopedTypeVariables
+      TupleSections
+      ViewPatterns
+  ghc-options: -Wall -O0 -fno-warn-unused-do-bind -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      Glob
+    , aeson
+    , base
+    , containers
+    , directory
+    , file-embed
+    , filepath
+    , mtl
+    , process
+    , purescript
+    , purescript-go
+    , text
+    , transformers
+  default-language: Haskell2010

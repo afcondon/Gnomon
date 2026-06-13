@@ -1,0 +1,5 @@
+=== Trivial ===
+TEST circle: 48
+TEST rect: 15
+TEST add: 42
+TEST done: ok

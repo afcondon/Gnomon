@@ -1,0 +1,64 @@
+name: purescript-go
+version: "0.0.1"
+synopsis: PureScript Programming Language Go Back-end (spike)
+description:
+  Go backend for PureScript. Consumes CoreFn JSON (purs --codegen corefn) and
+  emits Go source via a statement-form Go AST + pretty-printer + gofmt post-pass.
+  Third turn of the purerl -> Julia -> Python backend genealogy; reaches back to
+  grandparent purerl for the statement-oriented AST/Pretty machinery.
+category: Language
+author: Andrew Condon
+copyright: (c) 2026 Andrew Condon
+license: BSD3
+github: afcondon/purescript-go
+
+dependencies:
+  - aeson
+  - base
+  - containers
+  - directory
+  - file-embed
+  - filepath
+  - Glob
+  - mtl
+  - process
+  - purescript
+  - text
+  - transformers
+
+library:
+  source-dirs: src
+  ghc-options: -Wall -O0
+
+executables:
+  psgo:
+    main: Main.hs
+    source-dirs: app
+    ghc-options: -Wall -O0 -fno-warn-unused-do-bind -threaded -rtsopts -with-rtsopts=-N
+    dependencies:
+      - purescript-go
+
+default-extensions:
+  - ConstraintKinds
+  - DataKinds
+  - DeriveFunctor
+  - DeriveFoldable
+  - DeriveTraversable
+  - DeriveGeneric
+  - DerivingStrategies
+  - EmptyDataDecls
+  - FlexibleContexts
+  - KindSignatures
+  - LambdaCase
+  - MultiParamTypeClasses
+  - NoImplicitPrelude
+  - PatternGuards
+  - PatternSynonyms
+  - RankNTypes
+  - RecordWildCards
+  - OverloadedStrings
+  - ScopedTypeVariables
+  - TupleSections
+  - ViewPatterns
+
+stability: experimental
