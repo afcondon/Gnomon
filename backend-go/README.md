@@ -85,12 +85,17 @@ helper-call ABI above and the Effect thunk model (`EffectBind` → sequenced
   saturation guarantee (f may be partial/over-applied), so a native `f(a,b,c)`
   would be unsound on a strict-arity target like Go. **We have already banked every
   cheap uncurrying win the IR offers.**
+- ✅ **Benchmarked** vs the Phase-1 oracle + node (JS) — see `BENCHMARKS.md`
+  (`./run_bench.sh`). Result: the optimizer IR is a measured **1.6×–22×** win over
+  the naive oracle (biggest where primop density is highest — `fib` is 22× via
+  primitive dict-elimination), backend-go ~ties node on call-heavy code, and the
+  **only large gap to node is deep tail loops (~19×)** — confirming TCO as the #1
+  lever with data.
 - ⬜ Real perf levers from here, in priority order: (1) **TCO** — backend-es's
   `TcoExpr` analysis + join points + dispatch-loop codegen; we have none (Phase 1
-  leaned on Go's growable goroutine stack). (2) A codegen-side **inline table**
-  (`inlineApp` analog) for known saturated builtins.
-- ⬜ Benchmark vs the `main` (Phase 1) oracle + JS first, to target the lever with
-  data rather than assumption.
+  leaned on Go's growable goroutine stack). The benchmark shows this is the whole
+  gap to node. (2) A codegen-side **inline table** (`inlineApp` analog) for known
+  saturated builtins (the `BenchFold` ~2.3× boxing/HOF gap).
 - ⬜ Whole-program build currently compiles all ~200 modules into one package;
   a per-entry prune (cf Phase 1 `--entry`) would speed `go build`.
 
