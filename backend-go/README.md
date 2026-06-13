@@ -67,9 +67,30 @@ helper-call ABI above and the Effect thunk model (`EffectBind` → sequenced
 ## Status
 
 - ✅ Builds against the optimizer; `codegenModule` typechecks against the live IR.
-- ✅ Emits coherent Go for all ~200 corpus modules (helper-based `any` runtime).
-- ⬜ `runtime.go` + a `main()` emitter; then close the conformance loop against
-  the Phase 1 corpus (diff vs JS, same `KNOWN_DIVERGENCES` ledger).
-- ⬜ Not-yet-handled IR nodes (emit `_todo`): `Update`, `LetRec`, `Uncurried*`.
-- ⬜ Stage 2a proper: emit native Go multi-arg funcs from multi-arg `Abs`
-  (currently desugared to curried unary closures = Phase 1 semantics).
+- ✅ `runtime.go` (ported from Phase 1 `prelude.go` + the helper ABI) and a
+  `main()` emitter (`entrypoint.go`).
+- ✅ **Conformance: 10/10 corpus modules green** — 8 byte-identical to the JS
+  reference, 2 (Recursion, Strings) differ only on the seeded INT64/ASTRAL
+  ledger, exactly matching Phase 1. Reproduce: `./run_conformance.sh`.
+- ✅ Implemented IR nodes: `Var/Local/Lit/App/Abs/Accessor/CtorSaturated/CtorDef/
+  Let/LetRec/EffectBind/EffectPure/EffectDefer/Branch/PrimOp/PrimEffect/
+  PrimUndefined/Fail/Uncurried{,Effect}{Abs,App}`.
+- ⬜ Still `_todo`: `Update` (record update) — no corpus test hits it yet.
+- ⬜ Stage 2a proper: emit native Go multi-arg funcs from multi-arg `Abs`/
+  `UncurriedAbs` (curried unary `Abs` desugar still in place = Phase 1 semantics).
+  This is where the optimizer's uncurrying turns into an actual Go-level win.
+- ⬜ Benchmark vs the `main` (Phase 1) oracle + JS, to quantify the IR's gains.
+- ⬜ Whole-program build currently compiles all ~200 modules into one package;
+  a per-entry prune (cf Phase 1 `--entry`) would speed `go build`.
+
+### Runtime notes / decisions
+- `_lazy` returns a distinct `*_thunk`; `_force` unwraps thunks and passes
+  direct values (foreign shims) through — so per-module codegen needn't know the
+  global generated-vs-foreign name set, and lazy thunks don't collide with
+  `Effect a` (`func() any`).
+- `OpBooleanAnd`/`Or` emit native short-circuiting `&&`/`||` (via `_truthy`),
+  NOT helper calls — the optimizer relies on short-circuit (e.g.
+  `isTag Just && p(field0)` must not touch `field0` when the ctor isn't `Just`).
+- Non-finite `Number` literals emit `_posInf/_negInf/_nan` (PureScript `show`
+  would render `Infinity`/`NaN`, invalid Go).
+- Files starting with `_` are ignored by the Go toolchain, hence `entrypoint.go`.

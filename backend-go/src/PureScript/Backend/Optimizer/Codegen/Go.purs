@@ -31,6 +31,7 @@ import Data.Array.NonEmpty as NEA
 import Data.Foldable (foldMap)
 import Data.Maybe (Maybe(..))
 import Data.Newtype (unwrap)
+import Data.Number as Number
 import Data.String as String
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
@@ -62,6 +63,12 @@ codegenModule _ mod =
   declSection = String.joinWith "\n"
     (map (\(Tuple ident _) -> "var " <> topName mod.name ident <> " any") flatBindings)
 
+  -- Every top-level binding is a memoized lazy thunk (purs $runtime_lazy
+  -- analog). Cyclic dictionary CAFs span modules in the whole-program build, so
+  -- nothing can be eagerly ordered; references to top-level bindings are forced
+  -- on use (see genExpr Var). Runtime/foreign shims are ALSO _lazy-wrapped vars
+  -- (in runtime.go) so _force is uniform and per-module codegen needn't know the
+  -- global generated-vs-foreign name set.
   initSection :: String
   initSection = String.joinWith "\n"
     ( [ "func init() {" ]
@@ -70,7 +77,7 @@ codegenModule _ mod =
     )
     where
     assignLine (Tuple ident expr) =
-      topName mod.name ident <> " = " <> genExpr expr
+      topName mod.name ident <> " = _lazy(func() any { return " <> genExpr expr <> " })"
 
 --------------------------------------------------------------------------------
 -- Names
@@ -83,16 +90,40 @@ topName mn ident = goModuleName mn <> "_" <> goIdent ident
 goModuleName :: ModuleName -> String
 goModuleName (ModuleName mn) = String.replaceAll (String.Pattern ".") (String.Replacement "_") mn
 
--- | Sanitize a PureScript identifier into a Go-safe one. Minimal for the slice;
--- | the Phase 1 bijective mangler (reserved-word escaping) is a follow-up.
+-- | Sanitize a PureScript identifier into a Go-safe one, matching Phase 1's
+-- | @CodeGen.Common.identToGoName@ EXACTLY so the names line up with the foreign
+-- | shims ported from prelude.go. Char escapes mirror Phase 1; a Go-reserved
+-- | word gets a trailing @_@, escaped iff its trailing-underscore-stripped CORE
+-- | is reserved -- keeping the map (PS @map@ -> @map_@, foreign @map_@ ->
+-- | @map__@) a bijection so distinct PS idents never collide.
 goIdent :: Ident -> String
-goIdent (Ident s) = foldMap esc (SCU.toCharArray s)
+goIdent (Ident s) =
+  let name = foldMap esc (SCU.toCharArray s)
+      -- core = name with trailing underscores stripped
+      core = SCU.fromCharArray (Array.reverse (Array.dropWhile (_ == '_') (Array.reverse (SCU.toCharArray name))))
+  in if isGoReserved core then name <> "_" else name
   where
   esc c = case c of
     '\'' -> "P_"
     '$' -> "S_"
     '.' -> "_"
-    _ -> SCU.singleton c
+    '-' -> "_"
+    _ ->
+      if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+        then SCU.singleton c
+        else "_u" <> SCU.singleton c -- non-ASCII-ident char; rare in our corpus
+
+isGoReserved :: String -> Boolean
+isGoReserved name = Array.elem name
+  [ "break", "case", "chan", "const", "continue"
+  , "default", "defer", "else", "fallthrough", "for"
+  , "func", "go", "goto", "if", "import"
+  , "interface", "map", "package", "range", "return"
+  , "select", "struct", "switch", "type", "var"
+  , "any", "nil", "true", "false", "iota"
+  , "len", "cap", "make", "new", "append", "panic"
+  , "string", "int", "int64", "float64", "bool", "byte", "rune"
+  ]
 
 -- | A local binder named from its de Bruijn 'Level' (optimizer guarantees
 -- | uniqueness within a scope), prefixed by the source name when present for
@@ -110,8 +141,9 @@ localName mbIdent (Level n) = case mbIdent of
 
 genExpr :: NeutralExpr -> String
 genExpr (NeutralExpr syn) = case syn of
-  Var (Qualified (Just mn) ident) -> topName mn ident
-  Var (Qualified Nothing ident) -> goIdent ident
+  -- Top-level references are forced (every top-level binding is a lazy thunk).
+  Var (Qualified (Just mn) ident) -> "_force(" <> topName mn ident <> ")"
+  Var (Qualified Nothing ident) -> "_force(" <> goIdent ident <> ")"
 
   Local mbIdent lvl -> localName mbIdent lvl
 
@@ -128,11 +160,19 @@ genExpr (NeutralExpr syn) = case syn of
       (genExpr body)
       (NEA.toArray params)
 
-  -- Uncurried FFI (Fn/EffectFn). Follow-up: emit real Go multi-arg funcs/calls.
-  UncurriedApp _ _ -> todo "UncurriedApp"
-  UncurriedAbs _ _ -> todo "UncurriedAbs"
-  UncurriedEffectApp _ _ -> todo "UncurriedEffectApp"
-  UncurriedEffectAbs _ _ -> todo "UncurriedEffectAbs"
+  -- Uncurried FFI (Fn/EffectFn): real Go multi-arg funcs via variadic
+  -- `func(...any) any` (matches Phase 1's _mkFn/_runFn). Calling a pure
+  -- uncurried fn returns its value; an effect uncurried fn RUNS its effect on
+  -- call, so its body is forced and the call site is wrapped in a thunk for
+  -- uniform _runEffect.
+  UncurriedAbs params body ->
+    uncurriedFn (Array.fromFoldable params) (genExpr body)
+  UncurriedApp f args ->
+    "(" <> genExpr f <> ").(func(...any) any)(" <> commaSep (map genExpr args) <> ")"
+  UncurriedEffectAbs params body ->
+    uncurriedFn (Array.fromFoldable params) ("_runEffect(" <> genExpr body <> ")")
+  UncurriedEffectApp f args ->
+    "func() any { return (" <> genExpr f <> ").(func(...any) any)(" <> commaSep (map genExpr args) <> ") }"
 
   Accessor a acc -> genAccessor (genExpr a) acc
 
@@ -146,18 +186,35 @@ genExpr (NeutralExpr syn) = case syn of
   CtorDef _ _ (Ident tag) fieldNames ->
     ctorBuilder tag fieldNames
 
-  LetRec _ _ _ -> todo "LetRec"
+  -- Recursive let group: declare all names, then assign (Go closures capture by
+  -- reference, so mutual recursion resolves), then the body. All bindings share
+  -- the group Level; localName disambiguates by ident.
+  LetRec lvl bindings body ->
+    let
+      binds = NEA.toArray bindings
+      nm ident = localName (Just ident) lvl
+    in
+      iife
+        ( map (\(Tuple ident _) -> "var " <> nm ident <> " any") binds
+            <> map (\(Tuple ident e) -> nm ident <> " = " <> genExpr e) binds
+            <> map (\(Tuple ident _) -> "_ = " <> nm ident) binds
+            <> [ "return " <> genExpr body ]
+        )
 
   Let mbIdent lvl val body ->
+    let nm = localName mbIdent lvl in
     iife
-      [ "var " <> localName mbIdent lvl <> " any = " <> genExpr val
+      [ "var " <> nm <> " any = " <> genExpr val
+      , "_ = " <> nm  -- the optimizer may bind a value the body ignores; Go errors on unused locals
       , "return " <> genExpr body
       ]
 
   EffectBind mbIdent lvl val body ->
     -- Effect a == func() any. Bind sequences thunks; whole thing is a thunk.
+    let nm = localName mbIdent lvl in
     "func() any {\n" <>
-      "var " <> localName mbIdent lvl <> " any = _runEffect(" <> genExpr val <> ")\n" <>
+      "var " <> nm <> " any = _runEffect(" <> genExpr val <> ")\n" <>
+      "_ = " <> nm <> "\n" <>
       "return _runEffect(" <> genExpr body <> ")\n" <>
     "}"
 
@@ -184,7 +241,14 @@ genExpr (NeutralExpr syn) = case syn of
 genLit :: Literal NeutralExpr -> String
 genLit = case _ of
   LitInt n -> show n
-  LitNumber n -> show n
+  -- PureScript `show :: Number -> String` renders non-finite values as the
+  -- bare tokens Infinity/-Infinity/NaN, which aren't valid Go float syntax.
+  -- Non-finite literals reference runtime.go package vars (generated module
+  -- files carry no imports; runtime.go owns the `math` import).
+  LitNumber n
+    | Number.isNaN n -> "_nan"
+    | not (Number.isFinite n) -> if n < 0.0 then "_negInf" else "_posInf"
+    | otherwise -> show n
   LitString s -> goStr s
   LitChar c -> goStr (SCU.singleton c)
   LitBoolean b -> if b then "true" else "false"
@@ -222,8 +286,12 @@ genOp1 op a = case op of
 genOp2 :: BackendOperator2 -> String -> String -> String
 genOp2 op a b = case op of
   OpArrayIndex -> call2 "_arrayIndex" a b
-  OpBooleanAnd -> call2 "_and" a b
-  OpBooleanOr -> call2 "_or" a b
+  -- && / || MUST short-circuit: the optimizer emits e.g. `isTag Just && p(field0)`
+  -- relying on the right operand not evaluating when the left is false (it would
+  -- index a missing ctor field otherwise). _truthy boxes a concrete-bool operand
+  -- safely, and Go's && / || skip the right operand entirely.
+  OpBooleanAnd -> "(_truthy(" <> a <> ") && _truthy(" <> b <> "))"
+  OpBooleanOr -> "(_truthy(" <> a <> ") || _truthy(" <> b <> "))"
   OpBooleanOrd o -> call2 ("_bool" <> ordSuffix o) a b
   OpCharOrd o -> call2 ("_char" <> ordSuffix o) a b
   OpIntBitAnd -> call2 "_bitAnd" a b
@@ -277,6 +345,17 @@ curriedApp f x = "(" <> f <> ").(func(any) any)(" <> x <> ")"
 
 closure :: String -> String -> String
 closure param body = "func(" <> param <> " any) any {\n" <> body <> "\n}"
+
+-- | A variadic uncurried function: binds each param from _args[i], then returns
+-- | the given expression. Used for Fn/EffectFn (UncurriedAbs/UncurriedEffectAbs).
+uncurriedFn :: Array (Tuple (Maybe Ident) Level) -> String -> String
+uncurriedFn params retExpr =
+  "func(_args ...any) any {\n"
+    <> String.joinWith "\n" (Array.mapWithIndex bindParam params <> [ "return " <> retExpr ])
+    <> "\n}"
+  where
+  bindParam i (Tuple mbI lvl) =
+    let nm = localName mbI lvl in "var " <> nm <> " any = _args[" <> show i <> "]\n_ = " <> nm
 
 iife :: Array String -> String
 iife stmts = "func() any {\n" <> String.joinWith "\n" stmts <> "\n}()"
