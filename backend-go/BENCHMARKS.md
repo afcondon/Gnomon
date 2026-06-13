@@ -12,16 +12,27 @@ Stage-1 TCO landed** (single self-recursive top-level loops → Go `for {}`):
 | Workload | Stresses | node (JS) | backend-go | psgo (oracle) | Path B vs node | Path B vs oracle |
 |---|---|---:|---:|---:|---:|---:|
 | `BenchFib` — `fib 33` | non-tail recursion + int arithmetic | 0.06 | **0.05** | 1.17 | ~tied | **23× faster** |
-| `BenchFold` — `foldl (+)` 5000×1000 | HOF / Foldable dict / boxing | 0.06 | 0.14 | 0.23 | ~2.3× slower | 1.6× faster |
-| `BenchLoop` — `countTo 1e6` ×30 | deep tail recursion (top-level) | 0.11 | 0.50 | 5.22 | ~4.5× slower | **10× faster** |
-| `BenchLocal` — local `where go` ×30 | deep tail recursion (local idiom) | 0.11 | 0.59 | 6.31 | ~5.4× slower | **11× faster** |
+| `BenchFold` — `foldl (+)` 5000×1000 | HOF / Foldable dict / boxing | 0.06 | 0.13 | 0.23 | ~2.2× slower | 1.8× faster |
+| `BenchLoop` — `countTo 1e6` ×30 | deep tail recursion (top-level) | 0.11 | **0.01** | 5.38 | **~11× faster** | **~500× faster** |
+| `BenchLocal` — local `where go` ×30 | deep tail recursion (local idiom) | 0.11 | **0.01** | 6.29 | **~11× faster** | **~500× faster** |
 
 Checksums (all backends agree): `3524578` / `462494` / `30` / `30`.
 
-`BenchLocal` is the same workload as `BenchLoop` but the counter is a local
-`where go` helper — the common real-world shape. TCO Stage 2a turns it into a Go
-`for {}` too, so it performs like the top-level loop (0.59s ≈ 0.50s) rather than
-the oracle's stack recursion (6.31s).
+### Unboxing impact (`BenchLoop` / `BenchLocal`)
+
+| | pre-TCO | post-TCO | post-unboxing |
+|---|---:|---:|---:|
+| backend-go | 2.10s | 0.50s | **0.01s** |
+| vs node | ~19× slower | ~4.5× slower | **~11× faster** |
+
+Native-`int` loop registers (assert `.(int)` once at entry, native arithmetic +
+comparisons through the loop, `any(x)` box once at exit) eliminate the
+per-iteration boxing that TCO alone left behind. The loop is now genuinely native
+Go — *faster than V8* (whose JS still allocates/GCs and pays ~40ms startup). This
+is the first workload where backend-go beats the reference. The remaining gap to
+node is `BenchFold`'s ~2.2× — a higher-order `Foldable` fold whose boxing the
+loop-register unboxing doesn't reach (next: typed-argument unboxing across the
+`func(any) any` calling convention).
 
 ### Stage-1 TCO impact (`BenchLoop`)
 

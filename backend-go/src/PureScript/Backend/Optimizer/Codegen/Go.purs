@@ -47,6 +47,8 @@ import Data.Foldable (foldMap)
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Newtype (unwrap)
 import Data.Number as Number
+import Data.Set (Set)
+import Data.Set as Set
 import Data.String as String
 import Data.String.CodeUnits as SCU
 import Data.Traversable (traverse)
@@ -210,8 +212,18 @@ loopBindings nameOf refOf refName members = case NEA.toArray members of
 -- | copies, then a `for {}` re-binds the real param names each iteration; a tail
 -- | self-call reassigns the registers and `continue`s (no aliasing: args read the
 -- | per-iteration consts, write to separate registers), a leaf `return`s.
+-- |
+-- | UNBOXING: if the body is int-pure (`genStmtsInt` succeeds -- every tail-arg,
+-- | let-value and leaf is an int-typed PrimOp/literal/loop-local, every condition
+-- | an int comparison), the registers and per-iteration values are native Go
+-- | `int`: assert once at entry (`_c.(int)`), native arithmetic through the loop,
+-- | box once at exit (`any(x)`). Otherwise fall back to the all-`any` loop.
+-- | Successful int-emission IS the soundness proof, so this never regresses.
 selfLoopClosure :: String -> TcoRef -> NonEmptyArray (Tuple (Maybe Ident) Level) -> TcoExpr -> String
-selfLoopClosure tag ref params body = fnExpr
+selfLoopClosure tag ref params body =
+  case genStmtsInt ctx intSet body of
+    Just bodyI -> mkClosure regInitsI perIterBindsI bodyI
+    Nothing -> mkClosure regInits perIterBinds (genStmts ctx body)
   where
   ps = NEA.toArray params
   arity = Array.length ps
@@ -220,15 +232,98 @@ selfLoopClosure tag ref params body = fnExpr
   perIter (Tuple mbId lvl) = localName mbId lvl
   regs = Array.mapWithIndex (\i _ -> regName i) ps
   ctx = { members: [ { ref, arity } ], regs, branchReg: Nothing }
+  intSet = Set.fromFoldable (map perIter ps)
+
+  -- all-`any` registers / per-iteration consts
   regInits = Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i) ps
   perIterBinds = Array.mapWithIndex
     (\i p -> "var " <> perIter p <> " any = " <> regName i <> "\n_ = " <> perIter p) ps
-  loopBlock = String.joinWith "\n"
-    (regInits <> [ "for {" ] <> perIterBinds <> [ genStmts ctx body, "}" ])
+  -- native-`int` registers / per-iteration consts
+  regInitsI = Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i <> ".(int)") ps
+  perIterBindsI = Array.mapWithIndex
+    (\i p -> "var " <> perIter p <> " int = " <> regName i <> "\n_ = " <> perIter p) ps
+
   lastI = arity - 1
-  innermost = "func(" <> copyName lastI <> " any) any {\n" <> loopBlock <> "\n}"
   outerIdxs = if arity <= 1 then [] else Array.range 0 (arity - 2)
-  fnExpr = Array.foldr (\i acc -> "func(" <> copyName i <> " any) any { return " <> acc <> " }") innermost outerIdxs
+  mkClosure inits binds bodyStmts =
+    let
+      loopBlock = String.joinWith "\n" (inits <> [ "for {" ] <> binds <> [ bodyStmts, "}" ])
+      innermost = "func(" <> copyName lastI <> " any) any {\n" <> loopBlock <> "\n}"
+    in
+      Array.foldr (\i acc -> "func(" <> copyName i <> " any) any { return " <> acc <> " }") innermost outerIdxs
+
+-- | Emit an expression as a native Go `int`, or `Nothing` if it is not statically
+-- | int-typed (an int PrimOp, Int literal, or a known native-int loop local).
+genIntExpr :: Set String -> TcoExpr -> Maybe String
+genIntExpr ints (TcoExpr _ syn) = case syn of
+  Lit (LitInt n) -> Just (show n)
+  Local mbId lvl | Set.member (localName mbId lvl) ints -> Just (localName mbId lvl)
+  PrimOp (Op1 OpIntNegate a) -> (\s -> "(-" <> s <> ")") <$> genIntExpr ints a
+  PrimOp (Op2 (OpIntNum op) a b) -> case op of
+    OpAdd -> binI "+" a b
+    OpSubtract -> binI "-" a b
+    OpMultiply -> binI "*" a b
+    OpDivide -> Nothing -- PS div-by-zero returns 0; native `/` panics. Keep boxed.
+  _ -> Nothing
+  where
+  binI o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genIntExpr ints a <*> genIntExpr ints b
+
+-- | Emit a boolean condition natively (int comparisons and boolean connectives
+-- | over them), or `Nothing` if it is not such.
+genBoolInt :: Set String -> TcoExpr -> Maybe String
+genBoolInt ints (TcoExpr _ syn) = case syn of
+  PrimOp (Op2 (OpIntOrd op) a b) -> binI (ordOp op) a b
+  PrimOp (Op2 OpBooleanAnd a b) -> binB "&&" a b
+  PrimOp (Op2 OpBooleanOr a b) -> binB "||" a b
+  PrimOp (Op1 OpBooleanNot a) -> (\s -> "(!" <> s <> ")") <$> genBoolInt ints a
+  _ -> Nothing
+  where
+  binI o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genIntExpr ints a <*> genIntExpr ints b
+  binB o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genBoolInt ints a <*> genBoolInt ints b
+  ordOp = case _ of
+    OpEq -> "=="
+    OpNotEq -> "!="
+    OpLt -> "<"
+    OpLte -> "<="
+    OpGt -> ">"
+    OpGte -> ">="
+
+-- | Statement-mode walk of an int-pure loop body: native arithmetic throughout,
+-- | box only at the leaf `return`. Returns `Nothing` (→ caller falls back to the
+-- | all-`any` loop) if any node is not int-typed.
+genStmtsInt :: LoopCtx -> Set String -> TcoExpr -> Maybe String
+genStmtsInt ctx ints te@(TcoExpr _ syn) = case syn of
+  Branch pairs def -> do
+    parts <- traverse
+      ( \(Pair cond b) -> do
+          c <- genBoolInt ints cond
+          bb <- genStmtsInt ctx ints b
+          pure ("if " <> c <> " {\n" <> bb <> "\n}")
+      )
+      (NEA.toArray pairs)
+    d <- genStmtsInt ctx ints def
+    pure (String.joinWith "\n" parts <> "\n" <> d)
+
+  Let mbId lvl val rest -> do
+    v <- genIntExpr ints val
+    let nm = localName mbId lvl
+    rest' <- genStmtsInt ctx (Set.insert nm ints) rest
+    pure ("var " <> nm <> " int = " <> v <> "\n_ = " <> nm <> "\n" <> rest')
+
+  App (TcoExpr _ hsyn) args
+    | Just idx <- findMember ctx hsyn (NEA.length args) -> do
+        argStrs <- traverse (genIntExpr ints) (NEA.toArray args)
+        let
+          brLine = case ctx.branchReg of
+            Just br -> [ br <> " = " <> show idx ]
+            Nothing -> []
+          regLines = Array.mapWithIndex
+            (\i a -> fromMaybe "_" (Array.index ctx.regs i) <> " = " <> a) argStrs
+        pure (String.joinWith "\n" (brLine <> regLines) <> "\ncontinue")
+
+  _ -> do
+    e <- genIntExpr ints te
+    pure ("return any(" <> e <> ")")
 
 -- | A curried lambda `func(p0) any { return func(p1) any { return body } }`.
 curriedReturn :: Array String -> String -> String

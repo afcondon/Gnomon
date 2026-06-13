@@ -102,12 +102,20 @@ helper-call ABI above and the Effect thunk model (`EffectBind` → sequenced
   rather than stack recursion (oracle 6.31s). Opt-in per binding — join points and
   effect loops still fall through to the correct curried emission, so conformance
   stays 10/10.
-- ⬜ Remaining levers, in priority order: (1) **join points** (a local `Let`-bound
-  function tail-called from branches — backend-es's `toTcoJoin`/`codegenTcoJoin`),
-  and **effect-loop TCO** (recursive `Effect` loops, currently stack recursion).
-  (2) A codegen-side **inline table** (`inlineApp` analog) for known saturated
-  builtins, and/or concrete typing to kill the per-iteration `any`-boxing tax (the
-  residual `BenchLoop` ~4.5× and `BenchFold` ~2.3× gaps to node).
+- ✅ **Unboxing (MVP): native-`int` self-recursive loops.** If a loop body is
+  int-pure (`genStmtsInt` succeeds — every tail-arg/let-value/leaf is an int-typed
+  PrimOp/literal/loop-local, every condition an int comparison), registers and
+  per-iteration values are native Go `int`: assert `.(int)` once at entry, native
+  arithmetic through the loop, `any(x)` box once at exit. Successful int-emission
+  is the soundness proof, so it falls back to the all-`any` loop otherwise → no
+  regression. Measured: `BenchLoop`/`BenchLocal` **0.50s → 0.01s**, now ~11×
+  *faster* than node (first workload to beat the reference). 10/10 conformance.
+- ⬜ Remaining levers: (1) extend unboxing past self-recursive loops — typed
+  argument unboxing across the `func(any) any` calling convention (the `BenchFold`
+  ~2.2× gap: a `Foldable` HOF whose per-element boxing the loop unboxing doesn't
+  reach), and `Number`/`Boolean` registers. (2) join points + effect-loop
+  inlining (both marginal for the `any` runtime — deferred as low-value). (3)
+  optional per-entry prune to speed `go build`.
 - ⬜ Whole-program build currently compiles all ~200 modules into one package;
   a per-entry prune (cf Phase 1 `--entry`) would speed `go build`.
 
