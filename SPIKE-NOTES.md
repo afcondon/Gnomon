@@ -352,3 +352,121 @@ Phase-1 catalogue; prelude.go stays gofmt-clean and standalone-compilable.
 Next horizons: Phase 2 (Eibes's monomorphise+inline optimizing layer, with this
 backend as the correctness oracle), or broadening the corpus beyond the 10
 modules (typeclasses-heavy code, Aff, more of core).
+
+# Session 4 (2026-06-13) — Phase 2 Path B: the road to a fast backend
+
+Phase 1 was the *correct* backend (a hand-written Haskell CoreFn→Go emitter, on
+`main`, now the byte-identical oracle). Phase 2 is making it *fast*. This session
+is the whole arc from "correct but slow" to "beats node on tight loops" — recorded
+in full because the path included two evidence-based backtracks that are as
+instructive as the wins.
+
+## The fork: Path A vs Path B (and the surprise)
+
+Two roads to optimization: **A** = hand-roll passes on our own Haskell Go-AST
+(ref: purerl's `CodeGen/Optimizer/*`); **B** = consume `purescript-backend-
+optimizer`'s already-optimized IR. The surprise that decided the shape: the
+optimizer is written in **PureScript**, not Haskell — so Path B is a *second
+codebase in a second language* (`backend-go/`, a spago project), sharing only the
+conformance corpus with the Phase-1 Haskell oracle. Chose B on a feature branch
+(`phase2-backend-optimizer`). Wrote up the comparison for the polyglot site
+(`docs/backends/optimizer-ir-vs-handrolled-passes.md`).
+
+Closed the conformance loop first: backend-go consumes the IR, emits Go for the
+whole corpus, **10/10 green** (8 byte-identical, 2 INT64/ASTRAL ledger) — same
+profile as Phase 1. The IR handed us uncurrying, MagicDo'd Effect, whole-program
+DCE, and **typed PrimOps** (primitive dictionary elimination) for free.
+
+## Backtrack #1: native multi-arg "Stage 2a" — ABANDONED
+
+The planned next step was "emit native Go multi-arg funcs from the optimizer's
+pre-grouped `Abs`/`App`." Read the two reference consumers before touching green
+code: backend-es (`Convert.purs:241-258`) emits ordinary `Abs`/`App` as
+*curried-unary* (`esCurriedFunction` + a folded one-arg `EsCall` spine); purescm
+(`Chez/Syntax.purs`) does the same via `mkCurriedFn`/`runCurriedFn`. BOTH reserve
+native multi-arg for the `Uncurried*` (Fn/EffectFn) nodes only — which backend-go
+already emits natively. The reason: the optimizer's `App f args` is a *syntactic
+spine*, not a saturation guarantee (f may be partially/over-applied), so native
+`f(a,b,c)` is unsound on a strict-arity target like Go. **backend-go had already
+banked every cheap uncurrying win the IR offers.** Killed the plan, recorded why.
+
+## Benchmark-driven prioritization
+
+Built a 3-way harness (`run_bench.sh`, `BENCHMARKS.md`): node (JS reference) vs
+backend-go (Path B) vs psgo (Phase-1 oracle), over fib (non-tail rec), foldl
+(HOF), countTo×30 (tail loop). The numbers told us where to dig:
+
+- **Path B beat the naive oracle 1.6×–22×.** The 22× on `fib` traced — by reading
+  the emitted Go — to primitive dict-elim: the oracle routes `<`/`+`/`-` through
+  Ord/Ring *dictionary lookups* (`(_force(lessThan))(n)(2)`), backend-go emits
+  native `_intLt`/`_intAdd`/`_intSub`. The IR's free transforms, in wall-clock.
+- **The one big gap to node was deep tail loops (~19×).** backend-go had no TCO
+  (Phase 1 leaned on Go's growable stack). That set the agenda.
+
+## TCO Stages 1 + 2
+
+The analysis is free — the optimizer ships a reusable `Codegen.Tco.analyze` that
+decorates each node with a `TcoRole {isLoop, joins}`. We only wrote the codegen.
+
+- **Stage 1** (single self-recursive top-level): a `for {}` with register
+  double-buffering (the backend-es register/per-iteration-const split makes
+  parallel tail-arg reassignment aliasing-safe). `BenchLoop` 2.10s → 0.50s (4.2×).
+- **Stage 2** (local `where go` + mutual recursion): generalized `loopBindings` —
+  a single self-recursive fn → one `selfLoopClosure`; a mutual group → one
+  internal branch-dispatch loop (`_tcomut<tag>`, a branch register selects the
+  member) + a thin curried wrapper each. Bug worth noting: a *local* mutual loop's
+  internal closure references its sibling wrappers (non-tail calls), and Go forbids
+  a closure forward-referencing a later-declared local var — fixed with
+  declare-then-assign (top-level dodges this via package-level forward refs).
+
+TCO is opt-in per binding: anything unhandled falls through to the correct curried
+emission. Conformance stayed 10/10 throughout.
+
+## Backtrack #2: join points + effect loops — INVESTIGATED, DEFERRED
+
+Next on the roadmap. Investigation found both marginal for an `any` runtime:
+- *General effect-recursion* (`go n = do {…; go (n-1)}`) isn't flagged `isLoop` —
+  `analyze`'s `EffectBind` hits the `tcoNoTailCalls` fallthrough, and backend-es
+  doesn't TCO it either. Out of scope vs the reference.
+- *`forE`/`whileE`/`foreachE`* — backend-es inlines these into native loops, but
+  **backend-go's foreign shims already ARE native Go for-loops** (`for i :=
+  lo.(int); i < hi.(int); i++ {…}`). Inlining saves only a body-closure layer;
+  boxing remains.
+- *Join points* (role.joins) are correct-but-marginal: a closure-call vs a
+  continue jump.
+
+All three sit *above* the real cost. Pivoted to it instead.
+
+## The real fish: unboxing — and it bites
+
+Every hot path, including the TCO'd loops, was bottlenecked on per-iteration
+`any`-boxing: `_intAdd(v0_acc, 1)` boxes/asserts/allocates each iteration where
+native Go does `acc + 1`. The optimizer's typed PrimOps are the type oracle.
+
+**Unboxing MVP — native-`int` self-recursive loops.** If a loop body is int-pure
+(`genStmtsInt`/`genIntExpr`/`genBoolInt` succeed — every tail-arg/let-value/leaf
+an int-typed PrimOp/literal/loop-local, every condition an int comparison),
+registers and per-iteration values are native Go `int`: assert `.(int)` once at
+entry, native arithmetic + comparisons through the loop, `any(x)` box once at
+exit. The `func(any) any` interface is unchanged, so it composes with the all-
+`any` world. **Successful int-emission is the soundness proof** — no separate
+inference pass; non-int loops fall back to all-`any`, no regression.
+
+Result: `BenchLoop`/`BenchLocal` **0.50s → 0.01s** — now ~11× *faster than node*
+(V8 still allocates/GCs and pays ~40ms startup; a native Go int loop just wins)
+and ~500× the oracle. First workload where backend-go beats the reference.
+Conformance 10/10.
+
+## The arc, in one line (BenchLoop, backend-go)
+
+oracle 5.4s → Path B baseline (typed primops, no TCO) 2.1s → +TCO 0.50s →
++unboxing 0.01s  (node 0.11s).  dict-elim free from the IR → TCO 4.2× → unboxing
+50×. Two backtracks (native-multi-arg, join-points/effect-loops) kept the effort
+pointed at what the measurements said mattered.
+
+## Next
+
+Extend unboxing past self-recursive loops: typed *argument* unboxing across the
+`func(any) any` calling convention (the `BenchFold` ~2.2× gap — a Foldable HOF
+whose per-element boxing the loop unboxing doesn't reach), plus Number/Boolean
+registers. Join points + effect-loop inlining remain deferred as low-value.
