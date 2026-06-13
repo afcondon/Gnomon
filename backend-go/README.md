@@ -69,13 +69,18 @@ helper-call ABI above and the Effect thunk model (`EffectBind` → sequenced
 - ✅ Builds against the optimizer; `codegenModule` typechecks against the live IR.
 - ✅ `runtime.go` (ported from Phase 1 `prelude.go` + the helper ABI) and a
   `main()` emitter (`entrypoint.go`).
-- ✅ **Conformance: 10/10 corpus modules green** — 8 byte-identical to the JS
+- ✅ **Conformance: 15/15 corpus modules green** — 13 byte-identical to the JS
   reference, 2 (Recursion, Strings) differ only on the seeded INT64/ASTRAL
-  ledger, exactly matching Phase 1. Reproduce: `./run_conformance.sh`.
-- ✅ Implemented IR nodes: `Var/Local/Lit/App/Abs/Accessor/CtorSaturated/CtorDef/
-  Let/LetRec/EffectBind/EffectPure/EffectDefer/Branch/PrimOp/PrimEffect/
-  PrimUndefined/Fail/Uncurried{,Effect}{Abs,App}`.
-- ⬜ Still `_todo`: `Update` (record update) — no corpus test hits it yet.
+  ledger. Reproduce: `./run_conformance.sh`. Beyond the original 10, a coverage
+  sweep added **Records** (record update), **Classes** (typeclass hierarchies,
+  Maybe/Either, Traversable), **Maps** (Data.Map/Set), **Generic** (deriving +
+  genericShow), **Transformers** (State monad) — all byte-identical, needing only
+  one new foreign group (`Effect.Exception`, pulled in transitively by
+  `transformers`). Idiomatic PureScript is pure-PS atop the core foreign layer, so
+  it carries over for free.
+- ✅ Implemented IR nodes: `Var/Local/Lit/App/Abs/Accessor/Update/CtorSaturated/
+  CtorDef/Let/LetRec/EffectBind/EffectPure/EffectDefer/Branch/PrimOp/PrimEffect/
+  PrimUndefined/Fail/Uncurried{,Effect}{Abs,App}` — full `BackendSyntax` coverage.
 - ❌ ~~Stage 2a: native Go multi-arg from ordinary `Abs`/`App`~~ — **abandoned
   after reading the references.** Neither reference consumer does this: backend-es
   emits `esCurriedFunction` + a folded one-arg `EsCall` spine
