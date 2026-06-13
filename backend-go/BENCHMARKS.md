@@ -6,15 +6,30 @@ oracle). Reproduce with `./run_bench.sh`. All workloads print a bounded checksum
 that agrees across all three backends (no `INT64`/`ASTRAL` divergence), so this
 also double-checks correctness.
 
-First run measured 2026-06-13 on the MBP (median of 3 warm runs, real seconds):
+Measured 2026-06-13 on the MBP (median of 3 warm runs, real seconds), **after the
+Stage-1 TCO landed** (single self-recursive top-level loops → Go `for {}`):
 
 | Workload | Stresses | node (JS) | backend-go | psgo (oracle) | Path B vs node | Path B vs oracle |
 |---|---|---:|---:|---:|---:|---:|
 | `BenchFib` — `fib 33` | non-tail recursion + int arithmetic | 0.06 | **0.05** | 1.12 | ~tied | **22× faster** |
-| `BenchFold` — `foldl (+)` 5000×1000 | HOF / Foldable dict / boxing | 0.06 | 0.14 | 0.23 | ~2.3× slower | 1.6× faster |
-| `BenchLoop` — `countTo 1e6` ×30 | deep tail recursion (no TCO) | 0.11 | 2.10 | 5.40 | **~19× slower** | 2.5× faster |
+| `BenchFold` — `foldl (+)` 5000×1000 | HOF / Foldable dict / boxing | 0.06 | 0.13 | 0.23 | ~2.2× slower | 1.8× faster |
+| `BenchLoop` — `countTo 1e6` ×30 | deep tail recursion | 0.11 | 0.50 | 5.45 | ~4.5× slower | **11× faster** |
 
 Checksums (all three backends agree): `3524578` / `462494` / `30`.
+
+### Stage-1 TCO impact (`BenchLoop`)
+
+| | pre-TCO | post-TCO | speedup |
+|---|---:|---:|---:|
+| backend-go | 2.10s | **0.50s** | **4.2×** |
+| gap to node | ~19× | ~4.5× | — |
+
+TCO turned `countTo`/`driver` from stack recursion (two curried `func(any) any`
+type-asserts + a real Go frame per iteration) into a flat `for {}` with register
+reassignment + `continue`. The remaining ~4.5× gap to node is no longer call or
+stack overhead — it's the **`any`-boxing tax** on the per-iteration `_intAdd`/
+`_intEq` (V8 JITs the loop to unboxed int ops). That is the *next* lever
+(concrete typing / unboxing, or an inline table), not TCO.
 
 ## What the numbers say
 
@@ -37,15 +52,14 @@ if _truthy(_intLt(v0_n, 2)) { ... _intAdd(..., ...) ... _intSub(v0_n, 1) ... }
 `Op2 (OpIntOrd OpLt)` etc. That primitive-dict-elimination *is* the 22×. This is
 the Path B thesis, measured: the IR's free transforms are worth real time.
 
-**2. The residual gap to node is concentrated in deep tail loops — TCO is the
-#1 lever.** `BenchLoop` is ~19× node; the other two are ≤2.3×. backend-go has no
-TCO (Phase 1 leaned on Go's growable goroutine stack), so a 1e6-deep tail loop
-pays full curried-call + boxing cost on every iteration *and* grows real stack
-frames. Both reference consumers invest a whole TCO layer here (backend-es's
-`TcoExpr` analysis + join points + dispatch-loop codegen); we do not. This
-confirms the post-conformance roadmap: **TCO first**, then a codegen inline table
-for known saturated builtins (the `BenchFold` ~2.3× gap is the boxing/HOF tax that
-an inline table would chip at).
+**2. TCO was the #1 lever, and it's now landed (Stage 1).** Pre-TCO `BenchLoop`
+was ~19× node; deep tail loops paid full curried-call + boxing cost *and* grew
+real Go stack frames. Stage-1 TCO (single self-recursive top-level functions →
+`for {}`, consuming the optimizer's own `Codegen.Tco.analyze`) cut it to ~4.5×
+node — a 4.2× win on that workload. The remaining gap is the per-iteration
+`any`-boxing tax, not control flow. Still open: local `where go` loops, mutual
+recursion, and join points (Stage 2), plus a codegen inline table for the
+`BenchFold` ~2.2× HOF/boxing gap.
 
 **3. On call-heavy, primop-dense code backend-go already matches V8** (`fib`
 ~tied), and beats the naive oracle everywhere — so the `any`-boxed representation

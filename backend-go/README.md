@@ -91,11 +91,18 @@ helper-call ABI above and the Effect thunk model (`EffectBind` → sequenced
   primitive dict-elimination), backend-go ~ties node on call-heavy code, and the
   **only large gap to node is deep tail loops (~19×)** — confirming TCO as the #1
   lever with data.
-- ⬜ Real perf levers from here, in priority order: (1) **TCO** — backend-es's
-  `TcoExpr` analysis + join points + dispatch-loop codegen; we have none (Phase 1
-  leaned on Go's growable goroutine stack). The benchmark shows this is the whole
-  gap to node. (2) A codegen-side **inline table** (`inlineApp` analog) for known
-  saturated builtins (the `BenchFold` ~2.3× boxing/HOF gap).
+- ✅ **TCO (Stage 1): single self-recursive top-level loops** → Go `for {}`
+  dispatch loop, consuming the optimizer's own `Codegen.Tco.analyze` (see
+  `loopInit`/`genStmts` in `Go.purs`). Measured **4.2×** on `BenchLoop` (2.10s →
+  0.50s), closing the ~19× gap to node down to ~4.5×. Opt-in per binding; all
+  other shapes fall through to the correct curried emission, so conformance stays
+  10/10.
+- ⬜ Real perf levers from here, in priority order: (1) **TCO Stage 2** — local
+  `LetRec`/`Let` loops (the `where go` idiom), then mutual recursion + join points
+  (backend-es's `codegenTcoMutualLoopBindings`/join machinery). (2) A codegen-side
+  **inline table** (`inlineApp` analog) for known saturated builtins, and/or
+  concrete typing to kill the per-iteration `any`-boxing tax (the residual
+  `BenchLoop` ~4.5× and `BenchFold` ~2.2× gaps to node).
 - ⬜ Whole-program build currently compiles all ~200 modules into one package;
   a per-entry prune (cf Phase 1 `--entry`) would speed `go build`.
 
