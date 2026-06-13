@@ -39,6 +39,7 @@ module PureScript.Backend.Optimizer.Codegen.Go
 
 import Prelude
 
+import Control.Alt ((<|>))
 import Control.Alternative (guard)
 import Data.Array as Array
 import Data.Array.NonEmpty (NonEmptyArray)
@@ -213,17 +214,21 @@ loopBindings nameOf refOf refName members = case NEA.toArray members of
 -- | self-call reassigns the registers and `continue`s (no aliasing: args read the
 -- | per-iteration consts, write to separate registers), a leaf `return`s.
 -- |
--- | UNBOXING: if the body is int-pure (`genStmtsInt` succeeds -- every tail-arg,
--- | let-value and leaf is an int-typed PrimOp/literal/loop-local, every condition
--- | an int comparison), the registers and per-iteration values are native Go
--- | `int`: assert once at entry (`_c.(int)`), native arithmetic through the loop,
--- | box once at exit (`any(x)`). Otherwise fall back to the all-`any` loop.
--- | Successful int-emission IS the soundness proof, so this never regresses.
+-- | UNBOXING: if the body is numeric-pure for some primitive kind (`genStmtsK`
+-- | succeeds -- every tail-arg, let-value and leaf is a `kind`-typed
+-- | PrimOp/literal/loop-local, every condition a `kind` comparison), the
+-- | registers and per-iteration values are that native Go type (`int`/`float64`):
+-- | assert once at entry (`_c.(int)`), native arithmetic through the loop, box
+-- | once at exit (`any(x)`). We try `KInt` then `KNumber`; failing both, fall
+-- | back to the all-`any` loop. The loop must be uniform in kind (a mixed
+-- | int-counter + float-accumulator loop falls back -- per-register typing is the
+-- | post-MVP calling-convention work). Successful emission IS the soundness
+-- | proof, so this never regresses.
 selfLoopClosure :: String -> TcoRef -> NonEmptyArray (Tuple (Maybe Ident) Level) -> TcoExpr -> String
 selfLoopClosure tag ref params body =
-  case genStmtsInt ctx intSet body of
-    Just bodyI -> mkClosure regInitsI perIterBindsI bodyI
-    Nothing -> mkClosure regInits perIterBinds (genStmts ctx body)
+  case tryKind KInt <|> tryKind KNumber of
+    Just s -> s
+    Nothing -> mkClosure (regInits "") perIterBindsAny (genStmts ctx body)
   where
   ps = NEA.toArray params
   arity = Array.length ps
@@ -232,16 +237,17 @@ selfLoopClosure tag ref params body =
   perIter (Tuple mbId lvl) = localName mbId lvl
   regs = Array.mapWithIndex (\i _ -> regName i) ps
   ctx = { members: [ { ref, arity } ], regs, branchReg: Nothing }
-  intSet = Set.fromFoldable (map perIter ps)
+  typedSet = Set.fromFoldable (map perIter ps)
 
-  -- all-`any` registers / per-iteration consts
-  regInits = Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i) ps
-  perIterBinds = Array.mapWithIndex
+  tryKind k = mkClosure (regInits (".(" <> kindType k <> ")")) (perIterBindsTyped k)
+    <$> genStmtsNumeric k ctx typedSet body
+
+  -- registers: `_rN := _cN<assert>` (assert is "" for the all-`any` fallback)
+  regInits assert = Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i <> assert) ps
+  perIterBindsAny = Array.mapWithIndex
     (\i p -> "var " <> perIter p <> " any = " <> regName i <> "\n_ = " <> perIter p) ps
-  -- native-`int` registers / per-iteration consts
-  regInitsI = Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i <> ".(int)") ps
-  perIterBindsI = Array.mapWithIndex
-    (\i p -> "var " <> perIter p <> " int = " <> regName i <> "\n_ = " <> perIter p) ps
+  perIterBindsTyped k = Array.mapWithIndex
+    (\i p -> "var " <> perIter p <> " " <> kindType k <> " = " <> regName i <> "\n_ = " <> perIter p) ps
 
   lastI = arity - 1
   outerIdxs = if arity <= 1 then [] else Array.range 0 (arity - 2)
@@ -252,34 +258,61 @@ selfLoopClosure tag ref params body =
     in
       Array.foldr (\i acc -> "func(" <> copyName i <> " any) any { return " <> acc <> " }") innermost outerIdxs
 
--- | Emit an expression as a native Go `int`, or `Nothing` if it is not statically
--- | int-typed (an int PrimOp, Int literal, or a known native-int loop local).
-genIntExpr :: Set String -> TcoExpr -> Maybe String
-genIntExpr ints (TcoExpr _ syn) = case syn of
-  Lit (LitInt n) -> Just (show n)
-  Local mbId lvl | Set.member (localName mbId lvl) ints -> Just (localName mbId lvl)
-  PrimOp (Op1 OpIntNegate a) -> (\s -> "(-" <> s <> ")") <$> genIntExpr ints a
-  PrimOp (Op2 (OpIntNum op) a b) -> case op of
-    OpAdd -> binI "+" a b
-    OpSubtract -> binI "-" a b
-    OpMultiply -> binI "*" a b
-    OpDivide -> Nothing -- PS div-by-zero returns 0; native `/` panics. Keep boxed.
-  _ -> Nothing
-  where
-  binI o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genIntExpr ints a <*> genIntExpr ints b
+-- | A primitive loop-register kind we can keep native (unboxed). Mixed-kind loops
+-- | aren't handled (they need per-register typing across the calling convention).
+data NumKind = KInt | KNumber
 
--- | Emit a boolean condition natively (int comparisons and boolean connectives
--- | over them), or `Nothing` if it is not such.
-genBoolInt :: Set String -> TcoExpr -> Maybe String
-genBoolInt ints (TcoExpr _ syn) = case syn of
-  PrimOp (Op2 (OpIntOrd op) a b) -> binI (ordOp op) a b
-  PrimOp (Op2 OpBooleanAnd a b) -> binB "&&" a b
-  PrimOp (Op2 OpBooleanOr a b) -> binB "||" a b
-  PrimOp (Op1 OpBooleanNot a) -> (\s -> "(!" <> s <> ")") <$> genBoolInt ints a
+derive instance Eq NumKind
+
+kindType :: NumKind -> String
+kindType = case _ of
+  KInt -> "int"
+  KNumber -> "float64"
+
+guardKind :: NumKind -> NumKind -> Maybe Unit
+guardKind want k = if want == k then Just unit else Nothing
+
+-- | Emit an expression as a native value of `k` (Go `int`/`float64`), or `Nothing`
+-- | if it is not statically `k`-typed (a `k` PrimOp, `k` literal, or a known
+-- | native-`k` loop local).
+genNumeric :: NumKind -> Set String -> TcoExpr -> Maybe String
+genNumeric k typed (TcoExpr _ syn) = case syn of
+  Lit (LitInt n) -> guardKind KInt k $> show n
+  Lit (LitNumber n) | Number.isFinite n -> guardKind KNumber k $> show n
+  Local mbId lvl | Set.member (localName mbId lvl) typed -> Just (localName mbId lvl)
+  PrimOp (Op1 OpIntNegate a) -> guardKind KInt k *> neg a
+  PrimOp (Op1 OpNumberNegate a) -> guardKind KNumber k *> neg a
+  PrimOp (Op2 (OpIntNum op) a b) -> guardKind KInt k *> intBin op a b
+  PrimOp (Op2 (OpNumberNum op) a b) -> guardKind KNumber k *> numBin op a b
   _ -> Nothing
   where
-  binI o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genIntExpr ints a <*> genIntExpr ints b
-  binB o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genBoolInt ints a <*> genBoolInt ints b
+  neg a = (\s -> "(-" <> s <> ")") <$> genNumeric k typed a
+  bin o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genNumeric k typed a <*> genNumeric k typed b
+  intBin op a b = case op of
+    OpAdd -> bin "+" a b
+    OpSubtract -> bin "-" a b
+    OpMultiply -> bin "*" a b
+    -- PS int div-by-zero returns 0; native `/` panics. Route through _intDivI.
+    OpDivide -> (\x y -> "_intDivI(" <> x <> ", " <> y <> ")") <$> genNumeric k typed a <*> genNumeric k typed b
+  numBin op a b = case op of
+    OpAdd -> bin "+" a b
+    OpSubtract -> bin "-" a b
+    OpMultiply -> bin "*" a b
+    OpDivide -> bin "/" a b -- float /0 = ±Inf, matches JS
+
+-- | Emit a boolean condition natively (`k` comparisons + boolean connectives over
+-- | them), or `Nothing`.
+genBoolNumeric :: NumKind -> Set String -> TcoExpr -> Maybe String
+genBoolNumeric k typed (TcoExpr _ syn) = case syn of
+  PrimOp (Op2 (OpIntOrd op) a b) -> guardKind KInt k *> cmp op a b
+  PrimOp (Op2 (OpNumberOrd op) a b) -> guardKind KNumber k *> cmp op a b
+  PrimOp (Op2 OpBooleanAnd a b) -> conn "&&" a b
+  PrimOp (Op2 OpBooleanOr a b) -> conn "||" a b
+  PrimOp (Op1 OpBooleanNot a) -> (\s -> "(!" <> s <> ")") <$> genBoolNumeric k typed a
+  _ -> Nothing
+  where
+  cmp op a b = (\x y -> "(" <> x <> " " <> ordOp op <> " " <> y <> ")") <$> genNumeric k typed a <*> genNumeric k typed b
+  conn o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genBoolNumeric k typed a <*> genBoolNumeric k typed b
   ordOp = case _ of
     OpEq -> "=="
     OpNotEq -> "!="
@@ -288,31 +321,31 @@ genBoolInt ints (TcoExpr _ syn) = case syn of
     OpGt -> ">"
     OpGte -> ">="
 
--- | Statement-mode walk of an int-pure loop body: native arithmetic throughout,
+-- | Statement-mode walk of a `k`-pure loop body: native arithmetic throughout,
 -- | box only at the leaf `return`. Returns `Nothing` (→ caller falls back to the
--- | all-`any` loop) if any node is not int-typed.
-genStmtsInt :: LoopCtx -> Set String -> TcoExpr -> Maybe String
-genStmtsInt ctx ints te@(TcoExpr _ syn) = case syn of
+-- | all-`any` loop, or tries the next kind) if any node is not `k`-typed.
+genStmtsNumeric :: NumKind -> LoopCtx -> Set String -> TcoExpr -> Maybe String
+genStmtsNumeric k ctx typed te@(TcoExpr _ syn) = case syn of
   Branch pairs def -> do
     parts <- traverse
       ( \(Pair cond b) -> do
-          c <- genBoolInt ints cond
-          bb <- genStmtsInt ctx ints b
+          c <- genBoolNumeric k typed cond
+          bb <- genStmtsNumeric k ctx typed b
           pure ("if " <> c <> " {\n" <> bb <> "\n}")
       )
       (NEA.toArray pairs)
-    d <- genStmtsInt ctx ints def
+    d <- genStmtsNumeric k ctx typed def
     pure (String.joinWith "\n" parts <> "\n" <> d)
 
   Let mbId lvl val rest -> do
-    v <- genIntExpr ints val
+    v <- genNumeric k typed val
     let nm = localName mbId lvl
-    rest' <- genStmtsInt ctx (Set.insert nm ints) rest
-    pure ("var " <> nm <> " int = " <> v <> "\n_ = " <> nm <> "\n" <> rest')
+    rest' <- genStmtsNumeric k ctx (Set.insert nm typed) rest
+    pure ("var " <> nm <> " " <> kindType k <> " = " <> v <> "\n_ = " <> nm <> "\n" <> rest')
 
   App (TcoExpr _ hsyn) args
     | Just idx <- findMember ctx hsyn (NEA.length args) -> do
-        argStrs <- traverse (genIntExpr ints) (NEA.toArray args)
+        argStrs <- traverse (genNumeric k typed) (NEA.toArray args)
         let
           brLine = case ctx.branchReg of
             Just br -> [ br <> " = " <> show idx ]
@@ -322,7 +355,7 @@ genStmtsInt ctx ints te@(TcoExpr _ syn) = case syn of
         pure (String.joinWith "\n" (brLine <> regLines) <> "\ncontinue")
 
   _ -> do
-    e <- genIntExpr ints te
+    e <- genNumeric k typed te
     pure ("return any(" <> e <> ")")
 
 -- | A curried lambda `func(p0) any { return func(p1) any { return body } }`.
@@ -701,6 +734,3 @@ goStr s = "\"" <> foldMap escapeChar (SCU.toCharArray s) <> "\""
 
 commaSep :: Array String -> String
 commaSep = String.joinWith ", "
-
-todo :: String -> String
-todo what = "_todo(" <> goStr what <> ")"

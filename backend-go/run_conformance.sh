@@ -10,7 +10,7 @@ set -e
 HERE=${0:A:h}
 JSREF="$HERE/../test-suite"
 OUT=/tmp/bgo-conf
-mods=(ADTs Arrays Dictionaries Effects Numbers PatternMatch Recursion Strings STTests Uncurried Records Classes Maps Generic Transformers)
+mods=(ADTs Arrays Dictionaries Effects Numbers PatternMatch Recursion Strings STTests Uncurried Records Classes Maps Generic Transformers NumLoop)
 
 echo "==> building backend-go"
 (cd "$HERE" && spago build >/dev/null 2>&1)

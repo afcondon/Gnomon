@@ -2194,6 +2194,16 @@ func _zshr(a, b any) any   { return int(uint32(a.(int)) >> uint(b.(int)&31)) }
 func _strAppend(a, b any) any  { return a.(string) + b.(string) }
 func _arrayIndex(a, i any) any { return a.([]any)[i.(int)] }
 
+// Native int division with PureScript semantics: div-by-zero is 0 (the JS
+// foreign returns 0), truncation toward zero (Go `/` already does). Used by the
+// unboxed-int-loop codegen where `/` would otherwise panic on a zero divisor.
+func _intDivI(a, b int) int {
+	if b == 0 {
+		return 0
+	}
+	return a / b
+}
+
 // Immutable record update: copy the base record, overwrite the given fields.
 func _recordUpdate(base any, updates map[string]any) any {
 	m := base.(map[string]any)
