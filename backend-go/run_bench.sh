@@ -32,9 +32,8 @@ med3() {  # print median of 3 `time -p` real-seconds for command "$@"
 echo "==> compiling corpus (corefn,js)"
 ( cd "$TS" && spago build >/dev/null 2>&1 && eval "purs compile --codegen corefn,js $(spago sources 2>/dev/null | tr '\n' ' ')" >/dev/null 2>&1 )
 
-echo "==> emitting backend-go (Path B)"
-( cd "$HERE" && spago build >/dev/null 2>&1 && spago run -- --corefn-dir "$TS/output" --output-dir /tmp/bgo-bench --main Test.BenchFib >/dev/null 2>&1 )
-cp "$HERE/runtime.go" /tmp/bgo-bench/runtime.go
+echo "==> building backend-go (Path B)"
+( cd "$HERE" && spago build >/dev/null 2>&1 )
 
 echo "==> building psgo (oracle)"
 ( cd "$ROOT" && stack build >/dev/null 2>&1 )
@@ -45,8 +44,11 @@ printf '%-10s %12s %14s %14s\n' "--------" "--------" "----------" "------------
 for m in $mods; do
   # node
   js=$(cd "$TS" && med3 node --input-type=module -e "import('./output/Test.$m/index.js').then(x=>x.main())")
-  # backend-go: whole-program package, swap entrypoint, optimized build
-  ( cd /tmp/bgo-bench && printf 'package main\nfunc main() { _runEffect(_force(Test_%s_main)) }\n' "$m" > entrypoint.go && go build -o /tmp/bgo_$m *.go )
+  # backend-go: per-entry prune emits this program's reachable closure, then build
+  out=/tmp/bgo-bench/$m; rm -rf "$out"
+  ( cd "$HERE" && spago run -- --corefn-dir "$TS/output" --output-dir "$out" --main "Test.$m" >/dev/null 2>&1 )
+  cp "$HERE/runtime.go" "$out/runtime.go"
+  ( cd "$out" && go build -o /tmp/bgo_$m *.go )
   bg=$(med3 /tmp/bgo_$m)
   # psgo: --entry prune, optimized build
   out=/tmp/psgo-bench/Test.$m; mkdir -p "$out"
