@@ -49,11 +49,12 @@ import Data.Newtype (unwrap)
 import Data.Number as Number
 import Data.String as String
 import Data.String.CodeUnits as SCU
+import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Dodo as Dodo
 import PureScript.Backend.Optimizer.Convert (BackendBindingGroup, BackendModule)
 import PureScript.Backend.Optimizer.CoreFn (Ident(..), Literal(..), ModuleName(..), Prop(..), Qualified(..))
-import PureScript.Backend.Optimizer.Codegen.Tco (TcoExpr(..), TcoRef(..), analyze, tcoRoleIsLoop, topLevelTcoEnvGroup, topLevelTcoRefBindings)
+import PureScript.Backend.Optimizer.Codegen.Tco (TcoAnalysis(..), TcoExpr(..), TcoRef(..), analyze, tcoRoleIsLoop, topLevelTcoEnvGroup, topLevelTcoRefBindings)
 import PureScript.Backend.Optimizer.Semantics (NeutralExpr)
 import PureScript.Backend.Optimizer.Syntax (BackendAccessor(..), BackendEffect(..), BackendOperator(..), BackendOperator1(..), BackendOperator2(..), BackendOperatorNum(..), BackendOperatorOrd(..), BackendSyntax(..), Level(..), Pair(..))
 
@@ -87,13 +88,20 @@ genGroup mn grp = case NEA.fromArray grp.bindings of
   Nothing -> { decls: [], inits: [] }
   Just binds ->
     let
-      decls = map (\(Tuple ident _) -> "var " <> topName mn ident <> " any") (NEA.toArray binds)
       env = if grp.recursive then topLevelTcoEnvGroup mn binds else []
       analyzed = map (\(Tuple i e) -> Tuple i (analyze env e)) binds
     in
-      case if grp.recursive then loopInitFor mn analyzed else Nothing of
-        Just loopLine -> { decls, inits: [ loopLine ] }
-        Nothing -> { decls, inits: map (normalInit mn) (NEA.toArray analyzed) }
+      case if grp.recursive then loopPairs mn analyzed else Nothing of
+        -- loop pairs carry their own names (incl. the synthetic internal mutual
+        -- name), so derive decls from them rather than from the group idents.
+        Just pairs ->
+          { decls: map (\(Tuple nm _) -> "var " <> nm <> " any") pairs
+          , inits: map (\(Tuple nm expr) -> nm <> " = _lazy(func() any { return " <> expr <> " })") pairs
+          }
+        Nothing ->
+          { decls: map (\(Tuple ident _) -> "var " <> topName mn ident <> " any") (NEA.toArray binds)
+          , inits: map (normalInit mn) (NEA.toArray analyzed)
+          }
 
 normalInit :: ModuleName -> Tuple Ident TcoExpr -> String
 normalInit mn (Tuple ident body) =
@@ -103,44 +111,115 @@ normalInit mn (Tuple ident body) =
 -- TCO (Stage 1): single self-recursive top-level loops
 --------------------------------------------------------------------------------
 
-type LoopCtx = { ref :: TcoRef, regs :: Array String, arity :: Int }
+-- | One member of a loop group: how its (cross-/self-)calls are recognised, and
+-- | its arity. A single self-recursive function is a one-member group with no
+-- | branch register; a mutually-recursive group has a branch register and one
+-- | member per binding.
+type LoopMember = { ref :: TcoRef, arity :: Int }
+type LoopCtx = { members :: Array LoopMember, regs :: Array String, branchReg :: Maybe String }
 
--- | If this recursive group is a single self-recursive function the optimizer
--- | marked `isLoop`, return its `init()` assignment line as a dispatch loop.
-loopInitFor :: ModuleName -> NonEmptyArray (Tuple Ident TcoExpr) -> Maybe String
-loopInitFor mn analyzed = do
-  refBindings <- topLevelTcoRefBindings mn analyzed
-  guard (tcoRoleIsLoop refBindings)
-  case NEA.toArray analyzed of
-    [ Tuple ident body ] -> do
-      { params, body: inner } <- absParams body
-      pure (loopInit mn ident params inner)
-    _ -> Nothing
+type LoopBinding =
+  { ident :: Ident
+  , params :: NonEmptyArray (Tuple (Maybe Ident) Level)
+  , body :: TcoExpr
+  }
 
 absParams :: TcoExpr -> Maybe { params :: NonEmptyArray (Tuple (Maybe Ident) Level), body :: TcoExpr }
 absParams (TcoExpr _ (Abs params body)) = Just { params, body }
 absParams _ = Nothing
 
--- | Build `topName = _lazy(func() any { return <curried copies + for-loop> })`.
--- | The innermost closure binds mutable registers from its param copies, then a
--- | `for {}` that re-binds the real param names each iteration. A tail self-call
--- | reassigns the registers and `continue`s (no aliasing: args are read from the
--- | per-iteration consts, written to separate registers); a leaf `return`s.
-loopInit :: ModuleName -> Ident -> NonEmptyArray (Tuple (Maybe Ident) Level) -> TcoExpr -> String
-loopInit mn ident params body =
-  topName mn ident <> " = _lazy(func() any { return " <> fnExpr <> " })"
+loopBindingOf :: Tuple Ident TcoExpr -> Maybe LoopBinding
+loopBindingOf (Tuple ident e) = (\r -> { ident, params: r.params, body: r.body }) <$> absParams e
+
+-- | A per-group unique tag for register/copy names: the first member's first
+-- | param de Bruijn level. Sibling loops live in separate closures so name reuse
+-- | across them is harmless; nested loops get strictly deeper levels.
+loopTag :: NonEmptyArray LoopBinding -> String
+loopTag members = case NEA.head (NEA.head members).params of Tuple _ (Level n) -> show n
+
+-- | If this recursive group is one or more functions the optimizer marked
+-- | `isLoop`, return the Go (name, valueExpr) pairs of its dispatch loop. For a
+-- | mutually-recursive group this includes one synthetic internal-loop name plus
+-- | a wrapper per member; the internal name is forced on reference like any other
+-- | top-level binding (refName = `_force`).
+loopPairs :: ModuleName -> NonEmptyArray (Tuple Ident TcoExpr) -> Maybe (Array (Tuple String String))
+loopPairs mn analyzed = do
+  refBindings <- topLevelTcoRefBindings mn analyzed
+  guard (tcoRoleIsLoop refBindings)
+  members <- traverse loopBindingOf analyzed
+  pure $ loopBindings (topName mn) (TcoTopLevel <<< Qualified (Just mn)) (\n -> "_force(" <> n <> ")") members
+
+-- | Build the Go (name, valueExpr) pairs for one isLoop group: a single closure
+-- | for a self-recursive function, or an internal branch-dispatch loop plus one
+-- | curried wrapper per member for a mutually-recursive group.
+loopBindings
+  :: (Ident -> String)   -- how a member ident is named in Go
+  -> (Ident -> TcoRef)   -- how a member ident's calls are recognised
+  -> (String -> String)  -- how to reference the synthetic internal mutual name
+  -> NonEmptyArray LoopBinding
+  -> Array (Tuple String String)
+loopBindings nameOf refOf refName members = case NEA.toArray members of
+  [ m ] -> [ Tuple (nameOf m.ident) (selfLoopClosure tag (refOf m.ident) m.params m.body) ]
+  ms -> Array.cons (Tuple internalName internalFunc) (Array.mapWithIndex memberWrapper ms)
+  where
+  tag = loopTag members
+  arities = map (NEA.length <<< _.params) (NEA.toArray members)
+  maxArity = fromMaybe 1 (Array.last (Array.sort arities))
+  regName i = "_r" <> tag <> "_" <> show i
+  copyName i = "_c" <> tag <> "_" <> show i
+  branchReg = "_br" <> tag
+  branchCopy = "_brc" <> tag
+  regs = map regName (Array.range 0 (maxArity - 1))
+  ctx = { members: map (\m -> { ref: refOf m.ident, arity: NEA.length m.params }) (NEA.toArray members), regs, branchReg: Just branchReg }
+  internalName = "_tcomut" <> tag
+
+  internalFunc =
+    let
+      params = Array.cons branchCopy (map copyName (Array.range 0 (maxArity - 1)))
+      regInits = Array.cons (branchReg <> " := " <> branchCopy)
+        (Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i) regs)
+      branches = Array.mapWithIndex branchBlock (NEA.toArray members)
+    in
+      "func(" <> commaSep (map (_ <> " any") params) <> ") any {\n"
+        <> String.joinWith "\n" (regInits <> [ "for {" ] <> branches <> [ "}" ])
+        <> "\n}"
+
+  branchBlock idx m =
+    let
+      perIterBinds = Array.mapWithIndex
+        (\i (Tuple mbId lvl) -> "var " <> localName mbId lvl <> " any = " <> regName i <> "\n_ = " <> localName mbId lvl)
+        (NEA.toArray m.params)
+    in
+      "if _truthy(_intEq(" <> branchReg <> ", " <> show idx <> ")) {\n"
+        <> String.joinWith "\n" (perIterBinds <> [ genStmts ctx m.body ])
+        <> "\n}"
+
+  -- f = func(p0)..(pn) { return _internal(idx, p0..pn, nil-pad to maxArity) }
+  memberWrapper idx m =
+    let
+      ps = NEA.toArray m.params
+      paramNames = map (\(Tuple mbId lvl) -> localName mbId lvl) ps
+      callArgs = Array.cons (show idx) (paramNames <> Array.replicate (maxArity - Array.length ps) "nil")
+      internalType = "func(" <> commaSep (Array.replicate (1 + maxArity) "any") <> ") any"
+      call = refName internalName <> ".(" <> internalType <> ")(" <> commaSep callArgs <> ")"
+    in
+      Tuple (nameOf m.ident) (curriedReturn paramNames call)
+
+-- | The curried-copies + register-init + for-loop closure for ONE self-recursive
+-- | function. The innermost closure binds mutable registers from its param
+-- | copies, then a `for {}` re-binds the real param names each iteration; a tail
+-- | self-call reassigns the registers and `continue`s (no aliasing: args read the
+-- | per-iteration consts, write to separate registers), a leaf `return`s.
+selfLoopClosure :: String -> TcoRef -> NonEmptyArray (Tuple (Maybe Ident) Level) -> TcoExpr -> String
+selfLoopClosure tag ref params body = fnExpr
   where
   ps = NEA.toArray params
   arity = Array.length ps
-  -- a per-loop tag (the first param's de Bruijn level) keeps register/copy names
-  -- distinct from any enclosing loop; sibling loops live in separate closures so
-  -- name reuse across them is harmless.
-  loopTag = case NEA.head params of Tuple _ (Level n) -> show n
-  regName i = "_r" <> loopTag <> "_" <> show i
-  copyName i = "_c" <> loopTag <> "_" <> show i
+  regName i = "_r" <> tag <> "_" <> show i
+  copyName i = "_c" <> tag <> "_" <> show i
   perIter (Tuple mbId lvl) = localName mbId lvl
   regs = Array.mapWithIndex (\i _ -> regName i) ps
-  ctx = { ref: TcoTopLevel (Qualified (Just mn) ident), regs, arity }
+  ctx = { members: [ { ref, arity } ], regs, branchReg: Nothing }
   regInits = Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i) ps
   perIterBinds = Array.mapWithIndex
     (\i p -> "var " <> perIter p <> " any = " <> regName i <> "\n_ = " <> perIter p) ps
@@ -151,10 +230,15 @@ loopInit mn ident params body =
   outerIdxs = if arity <= 1 then [] else Array.range 0 (arity - 2)
   fnExpr = Array.foldr (\i acc -> "func(" <> copyName i <> " any) any { return " <> acc <> " }") innermost outerIdxs
 
+-- | A curried lambda `func(p0) any { return func(p1) any { return body } }`.
+curriedReturn :: Array String -> String -> String
+curriedReturn params body =
+  Array.foldr (\p acc -> "func(" <> p <> " any) any { return " <> acc <> " }") body params
+
 -- | Statement-mode, tail-aware walk used only for the body of a TCO loop.
--- | Tail calls to the loop ref become register reassignment + `continue`; every
--- | other tail position becomes `return <expr>` (evaluated by the expression
--- | walker). Branch/Let preserve tail position into their sub-bodies.
+-- | A tail call to a group member becomes branch+register reassignment +
+-- | `continue`; every other tail position becomes `return <expr>` (evaluated by
+-- | the expression walker). Branch/Let preserve tail position into sub-bodies.
 genStmts :: LoopCtx -> TcoExpr -> String
 genStmts ctx te@(TcoExpr _ syn) = case syn of
   Branch pairs def ->
@@ -169,18 +253,26 @@ genStmts ctx te@(TcoExpr _ syn) = case syn of
     in "var " <> nm <> " any = " <> genExpr val <> "\n_ = " <> nm <> "\n" <> genStmts ctx rest
 
   App (TcoExpr _ hsyn) args
-    | matchesRef ctx.ref hsyn
-    , NEA.length args == ctx.arity ->
-        String.joinWith "\n"
-          ( Array.mapWithIndex
-              (\i a -> fromMaybe "_" (Array.index ctx.regs i) <> " = " <> genExpr a)
-              (NEA.toArray args)
-          )
-          <> "\ncontinue"
+    | Just idx <- findMember ctx hsyn (NEA.length args) ->
+        let
+          brLine = case ctx.branchReg of
+            Just br -> [ br <> " = " <> show idx ]
+            Nothing -> []
+          regLines = Array.mapWithIndex
+            (\i a -> fromMaybe "_" (Array.index ctx.regs i) <> " = " <> genExpr a)
+            (NEA.toArray args)
+        in String.joinWith "\n" (brLine <> regLines) <> "\ncontinue"
 
   _ -> "return " <> genExpr te
 
--- | Does an application head refer to the current loop's self-binding?
+-- | Index of the loop member an application head refers to, if its arity matches.
+findMember :: LoopCtx -> BackendSyntax TcoExpr -> Int -> Maybe Int
+findMember ctx hsyn nargs =
+  Array.findIndex (\m -> m.arity == nargs && matchesRef m.ref hsyn) ctx.members
+
+isLoopAnalysis :: TcoAnalysis -> Boolean
+isLoopAnalysis (TcoAnalysis a) = a.role.isLoop
+
 matchesRef :: TcoRef -> BackendSyntax TcoExpr -> Boolean
 matchesRef ref syn = case ref of
   TcoTopLevel q -> case syn of
@@ -251,7 +343,7 @@ localName mbIdent (Level n) = case mbIdent of
 --------------------------------------------------------------------------------
 
 genExpr :: TcoExpr -> String
-genExpr (TcoExpr _ syn) = case syn of
+genExpr (TcoExpr ann syn) = case syn of
   -- Top-level references are forced (every top-level binding is a lazy thunk).
   Var (Qualified (Just mn) ident) -> "_force(" <> topName mn ident <> ")"
   Var (Qualified Nothing ident) -> "_force(" <> goIdent ident <> ")"
@@ -297,9 +389,29 @@ genExpr (TcoExpr _ syn) = case syn of
   CtorDef _ _ (Ident tag) fieldNames ->
     ctorBuilder tag fieldNames
 
-  -- Recursive let group: declare all names, then assign (Go closures capture by
-  -- reference, so mutual recursion resolves), then the body. All bindings share
-  -- the group Level; localName disambiguates by ident.
+  -- Recursive let group the optimizer marked `isLoop` (the `where go = ...`
+  -- idiom, and local mutual recursion): emit a dispatch loop bound to local vars,
+  -- exactly as for top-level loops but unwrapped (refName = identity, no _force).
+  LetRec lvl bindings body
+    | isLoopAnalysis ann
+    , Just members <- traverse loopBindingOf bindings ->
+        let
+          pairs = loopBindings (\ident -> localName (Just ident) lvl)
+            (\ident -> TcoLocal (Just ident) lvl) identity members
+        in
+          -- declare all names first, THEN assign: a local mutual loop's internal
+          -- closure references the member wrappers (non-tail calls), and Go
+          -- forbids forward-referencing a later-declared local var in a closure.
+          iife
+            ( map (\(Tuple nm _) -> "var " <> nm <> " any") pairs
+                <> map (\(Tuple nm expr) -> nm <> " = " <> expr) pairs
+                <> map (\(Tuple nm _) -> "_ = " <> nm) pairs
+                <> [ "return " <> genExpr body ]
+            )
+
+  -- Non-loop recursive let group: declare all names, then assign (Go closures
+  -- capture by reference, so mutual recursion resolves on the stack), then the
+  -- body. All bindings share the group Level; localName disambiguates by ident.
   LetRec lvl bindings body ->
     let
       binds = NEA.toArray bindings

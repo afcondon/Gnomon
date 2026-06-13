@@ -18,7 +18,7 @@ set -e
 HERE=${0:A:h}
 ROOT="$HERE/.."
 TS="$ROOT/test-suite"
-mods=(BenchFib BenchFold BenchLoop)
+mods=(BenchFib BenchFold BenchLoop BenchLocal)
 
 med3() {  # print median of 3 `time -p` real-seconds for command "$@"
   local t=()

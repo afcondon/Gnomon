@@ -11,11 +11,17 @@ Stage-1 TCO landed** (single self-recursive top-level loops → Go `for {}`):
 
 | Workload | Stresses | node (JS) | backend-go | psgo (oracle) | Path B vs node | Path B vs oracle |
 |---|---|---:|---:|---:|---:|---:|
-| `BenchFib` — `fib 33` | non-tail recursion + int arithmetic | 0.06 | **0.05** | 1.12 | ~tied | **22× faster** |
-| `BenchFold` — `foldl (+)` 5000×1000 | HOF / Foldable dict / boxing | 0.06 | 0.13 | 0.23 | ~2.2× slower | 1.8× faster |
-| `BenchLoop` — `countTo 1e6` ×30 | deep tail recursion | 0.11 | 0.50 | 5.45 | ~4.5× slower | **11× faster** |
+| `BenchFib` — `fib 33` | non-tail recursion + int arithmetic | 0.06 | **0.05** | 1.17 | ~tied | **23× faster** |
+| `BenchFold` — `foldl (+)` 5000×1000 | HOF / Foldable dict / boxing | 0.06 | 0.14 | 0.23 | ~2.3× slower | 1.6× faster |
+| `BenchLoop` — `countTo 1e6` ×30 | deep tail recursion (top-level) | 0.11 | 0.50 | 5.22 | ~4.5× slower | **10× faster** |
+| `BenchLocal` — local `where go` ×30 | deep tail recursion (local idiom) | 0.11 | 0.59 | 6.31 | ~5.4× slower | **11× faster** |
 
-Checksums (all three backends agree): `3524578` / `462494` / `30`.
+Checksums (all backends agree): `3524578` / `462494` / `30` / `30`.
+
+`BenchLocal` is the same workload as `BenchLoop` but the counter is a local
+`where go` helper — the common real-world shape. TCO Stage 2a turns it into a Go
+`for {}` too, so it performs like the top-level loop (0.59s ≈ 0.50s) rather than
+the oracle's stack recursion (6.31s).
 
 ### Stage-1 TCO impact (`BenchLoop`)
 
