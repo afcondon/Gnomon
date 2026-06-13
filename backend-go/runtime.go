@@ -2207,6 +2207,53 @@ func _recordUpdate(base any, updates map[string]any) any {
 	return n
 }
 
+// Effect.Exception: an Error is map[string]any{"message","name"}; throwException
+// panics with it, catchException recovers (wrapping a non-Error panic like the JS
+// shim's `new Error(e.toString())`). Pulled into the build transitively by
+// transformers (Control.Monad.Error.Class).
+func _exnError(msg any) any { return map[string]any{"message": msg, "name": "Error"} }
+
+var Effect_Exception_error any = func(msg any) any { return _exnError(msg) }
+var Effect_Exception_errorWithName any = func(msg any) any {
+	return func(nm any) any { return map[string]any{"message": msg, "name": nm} }
+}
+var Effect_Exception_message any = func(e any) any { return e.(map[string]any)["message"] }
+var Effect_Exception_name any = func(e any) any {
+	if n, ok := e.(map[string]any)["name"]; ok && n != nil {
+		return n
+	}
+	return "Error"
+}
+var Effect_Exception_showErrorImpl any = func(e any) any {
+	return "Error: " + fmt.Sprintf("%v", e.(map[string]any)["message"])
+}
+var Effect_Exception_stackImpl any = func(_just any) any {
+	return func(nothing any) any {
+		return func(_e any) any { return nothing } // no stack in our representation
+	}
+}
+var Effect_Exception_throwException any = func(e any) any {
+	return func() any { panic(e) }
+}
+var Effect_Exception_catchException any = func(c any) any {
+	return func(t any) any {
+		return func() (result any) {
+			defer func() {
+				if r := recover(); r != nil {
+					var errVal any
+					if m, ok := r.(map[string]any); ok && m["message"] != nil {
+						errVal = r
+					} else {
+						errVal = _exnError(fmt.Sprintf("%v", r))
+					}
+					result = c.(func(any) any)(errVal).(func() any)()
+				}
+			}()
+			return t.(func() any)()
+		}
+	}
+}
+
 // Effect / ST ref cells share Phase 1's representation: map[string]any{"value"}.
 func _refNew(v any) any { return map[string]any{"value": v} }
 func _refRead(r any) any { return r.(map[string]any)["value"] }

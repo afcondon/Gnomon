@@ -27,6 +27,7 @@ package:
     - st
     - strings
     - tailrec
+    - transformers
     - tuples
     - unfoldable
 workspace:
