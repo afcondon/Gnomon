@@ -20,6 +20,7 @@ package:
     - maybe
     - newtype
     - numbers
+    - ordered-collections
     - partial
     - prelude
     - refs

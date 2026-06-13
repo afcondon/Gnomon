@@ -2194,6 +2194,19 @@ func _zshr(a, b any) any   { return int(uint32(a.(int)) >> uint(b.(int)&31)) }
 func _strAppend(a, b any) any  { return a.(string) + b.(string) }
 func _arrayIndex(a, i any) any { return a.([]any)[i.(int)] }
 
+// Immutable record update: copy the base record, overwrite the given fields.
+func _recordUpdate(base any, updates map[string]any) any {
+	m := base.(map[string]any)
+	n := make(map[string]any, len(m))
+	for k, v := range m {
+		n[k] = v
+	}
+	for k, v := range updates {
+		n[k] = v
+	}
+	return n
+}
+
 // Effect / ST ref cells share Phase 1's representation: map[string]any{"value"}.
 func _refNew(v any) any { return map[string]any{"value": v} }
 func _refRead(r any) any { return r.(map[string]any)["value"] }

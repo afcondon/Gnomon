@@ -10,7 +10,7 @@ set -e
 HERE=${0:A:h}
 JSREF="$HERE/../test-suite"
 OUT=/tmp/bgo-conf
-mods=(ADTs Arrays Dictionaries Effects Numbers PatternMatch Recursion Strings STTests Uncurried)
+mods=(ADTs Arrays Dictionaries Effects Numbers PatternMatch Recursion Strings STTests Uncurried Records Classes Maps)
 
 echo "==> building backend-go"
 (cd "$HERE" && spago build >/dev/null 2>&1)
@@ -35,5 +35,5 @@ for m in $mods; do
     echo "[$mod] FAIL:"; diff /tmp/js_out.txt /tmp/go_out.txt | head -8; bad=$((bad+1))
   fi
 done
-echo "=== $pass identical + $ledger ledger-only = $((pass+ledger))/10 green; $bad bad ==="
+echo "=== $pass identical + $ledger ledger-only = $((pass+ledger))/${#mods[@]} green; $bad bad ==="
 [ $bad -eq 0 ]

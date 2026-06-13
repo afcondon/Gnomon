@@ -18,6 +18,7 @@
             "maybe",
             "newtype",
             "numbers",
+            "ordered-collections",
             "partial",
             "prelude",
             "refs",
@@ -838,6 +839,27 @@
         "functions",
         "maybe",
         "prelude"
+      ]
+    },
+    "ordered-collections": {
+      "type": "registry",
+      "version": "3.2.0",
+      "integrity": "sha256-NaEXc2cz/7lJfxPWEja4XlZbGxuRqJwFKQJjsJf51kQ=",
+      "dependencies": [
+        "arrays",
+        "control",
+        "foldable-traversable",
+        "functions",
+        "gen",
+        "lists",
+        "maybe",
+        "newtype",
+        "partial",
+        "prelude",
+        "safe-coerce",
+        "tailrec",
+        "tuples",
+        "unfoldable"
       ]
     },
     "orders": {

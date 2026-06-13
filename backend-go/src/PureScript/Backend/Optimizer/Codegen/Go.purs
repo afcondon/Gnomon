@@ -474,7 +474,11 @@ genExpr (TcoExpr ann syn) = case syn of
 
   Accessor a acc -> genAccessor (genExpr a) acc
 
-  Update _ _ -> todo "Update (record update)"
+  -- Immutable record update: copy the base map, overwrite the given fields.
+  Update base props ->
+    "_recordUpdate(" <> genExpr base <> ", map[string]any{" <> commaSep (map genProp props) <> "})"
+    where
+    genProp (Prop k v) = goStr k <> ": " <> genExpr v
 
   -- Fully-applied data constructor: V{Tag, Fields}.
   CtorSaturated _ _ _ (Ident tag) fields ->
