@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -623,6 +624,32 @@ var Effect_Console_warn any = func(s any) any { return _consoleThunk(s, os.Stder
 var Effect_Console_error any = func(s any) any { return _consoleThunk(s, os.Stderr) }
 var Effect_Console_group any = func(s any) any { return _consoleThunk(s, os.Stdout) }
 var Effect_Console_groupEnd any = func() any { return nil }
+
+// Bosun apply execution edge (Phase 6C): run one shell line and report
+// ok/code/message. A backgrounded launch (`… &`) is fire-and-forget: Start()
+// without Wait, stdio left nil (/dev/null) so the daemonising child can't hold
+// an output pipe open and hang us — exit 0 means "dispatched", actual health is
+// the observation edge's job. Everything else (docker, ssh) is synchronous via
+// CombinedOutput with captured output + real exit code. (EffectFn1 =
+// func(args ...any) any; the PureScript record is a map[string]any.)
+var Bosun_Conformance_ApplyMain_execLineImpl any = func(args ...any) any {
+	line := args[0].(string)
+	if strings.HasSuffix(strings.TrimSpace(line), "&") {
+		if err := exec.Command("/bin/sh", "-c", line).Start(); err != nil {
+			return map[string]any{"ok": false, "code": 1, "message": err.Error()}
+		}
+		return map[string]any{"ok": true, "code": 0, "message": "launched (backgrounded)"}
+	}
+	out, err := exec.Command("/bin/sh", "-c", line).CombinedOutput()
+	if err != nil {
+		code := 1
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		}
+		return map[string]any{"ok": false, "code": code, "message": strings.TrimSpace(string(out))}
+	}
+	return map[string]any{"ok": true, "code": 0, "message": strings.TrimSpace(string(out))}
+}
 
 // ---------------------------------------------------------------------------
 // Data.Function.Uncurried  (FnN represented as Go variadic func(...any) any)
