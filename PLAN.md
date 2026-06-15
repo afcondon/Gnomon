@@ -105,7 +105,7 @@ needed one; Go doesn't).
 ### Definition of done (Phase 1)
 Corpus green with a documented `KNOWN_DIVERGENCES` ledger (INT64/ASTRAL, seeded
 from Julia); the repr-canary passing; a benchmark-harness skeleton (copy
-`purescript-python-new/bench/run_bench.py`'s shape) so Phase 2 has a baseline to
+`purescript-python/bench/run_bench.py`'s shape) so Phase 2 has a baseline to
 measure against; a README pointing newcomers at the current compiler. Estimated
 ~2–2.5k lines, a handful of focused sessions. **This is grind against a measurable
 corpus — design risk was retired by the spike.**
@@ -209,7 +209,7 @@ runs. Ship the staged wins; document what stays boxed and why.
 
 ## Reference map (absolute paths + external)
 - **Skeleton + ADRs (copy/port):** `purescript-backends/purescript-julia/`
-  (Jurist) and `purescript-backends/purescript-python-new/` (purepy, sibling +
+  (Jurist) and `purescript-backends/purescript-python/` (purepy, sibling +
   lambda-lifting ADR).
 - **Grafts + optimizer reference:** `purescript-backends/purerl/` — `CodeGen/AST.hs`,
   `Pretty.hs`, `CodeGen/Optimizer/{Inliner,MagicDo,Memoize,Unused}.hs`,

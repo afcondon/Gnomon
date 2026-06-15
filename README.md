@@ -3,7 +3,7 @@
 A PureScript backend that compiles to Go. **Gnomon** — the rod whose
 shadow tells the truth — is the Go member of the polyglot-PureScript
 backends family, alongside [Jurist](../purescript-julia/) (PureScript →
-Julia, *the judge*) and [Pythia](../purescript-python-new/) (PureScript →
+Julia, *the judge*) and [Pythia](../purescript-python/) (PureScript →
 Python, *the oracle*). The three share the same architecture, the same
 ADR discipline, and the same differential-conformance method over a
 shared `Test.*` corpus.
