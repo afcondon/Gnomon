@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---------------------------------------------------------------------------
@@ -41,8 +42,7 @@ func _b2i(b bool) int {
 // _force(X). This defers all initialization to first use, so the cyclic
 // typeclass-dictionary clusters (whose cycle edges are lazy `\_ -> dict`
 // closures) resolve on demand regardless of declaration order -- the Go analogue
-// of purs's `$runtime_lazy`. The forcing flag turns a genuine eager value cycle
-// into a clear panic instead of an unbounded recursion.
+// of purs's `$runtime_lazy`.
 //
 // backend-go change vs Phase 1: codegen forces EVERY top-level Var reference
 // (per-module codegen can't cheaply know whether a name is a generated binding
@@ -50,11 +50,23 @@ func _b2i(b bool) int {
 // non-thunks (the direct-value foreign shims below) through untouched. That
 // also disambiguates a lazy thunk from an `Effect a` value -- both would
 // otherwise be `func() any`.
+//
+// CONCURRENCY: forcing is guarded by a per-thunk sync.Once, so a CAF shared
+// across goroutines (the `bosun serve` / any concurrent-server case) is forced
+// at most once and read race-free; the prior unsynchronized done/forcing/val
+// dance was a data race AND could spuriously panic. The Once does memoize-once
+// and mutual-exclusion in one. Tradeoff vs the old `forcing` flag: a GENUINE
+// eager self-referential strict cycle now DEADLOCKS (re-entrant Once on one
+// goroutine) instead of panicking. That input has no valid value either way,
+// and backend-go does not emit it — legitimate cyclic typeclass-dict clusters
+// break their cycles with deferred lazy `\_ -> dict` edges (no synchronous
+// re-force). The one place a deadlock is worse than a panic — a single hung
+// goroutine in a resident server, which Go's deadlock detector can't see — is
+// owned at the serve layer via request/handler timeouts, not here.
 type _thunk struct {
-	done    bool
-	forcing bool
-	val     any
-	fn      func() any
+	once sync.Once
+	val  any
+	fn   func() any
 }
 
 func _lazy(fn func() any) any {
@@ -62,22 +74,16 @@ func _lazy(fn func() any) any {
 }
 
 // _force evaluates a generated binding's memoized thunk; a direct value (any
-// foreign/runtime shim) is returned as-is.
+// foreign/runtime shim) is returned as-is. Thread-safe and forced-once.
 func _force(x any) any {
 	t, ok := x.(*_thunk)
 	if !ok {
 		return x
 	}
-	if t.done {
-		return t.val
-	}
-	if t.forcing {
-		panic("psgo: cyclic strict initialization")
-	}
-	t.forcing = true
-	t.val = t.fn()
-	t.done = true
-	t.fn = nil
+	t.once.Do(func() {
+		t.val = t.fn()
+		t.fn = nil
+	})
 	return t.val
 }
 
