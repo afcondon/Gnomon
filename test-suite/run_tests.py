@@ -46,6 +46,7 @@ TEST_MODULES = [
     "Test.Classes",
     "Test.Dictionaries",
     "Test.Effects",
+    "Test.Exceptions",
     "Test.Generic",
     "Test.Maps",
     "Test.NumLoop",
@@ -71,6 +72,9 @@ KNOWN_DIVERGENCES = {
     ("Test.Strings", "ASTRAL-cu-take-emoji"),
     ("Test.Recursion", "INT64-sumTo-1e6"),
     ("Test.Recursion", "INT64-fact-20"),
+    # STACK-: JS captures a stack when an Error is CONSTRUCTED; Go has a stack
+    # only while panicking, never on an error value. `Maybe` is the honest type.
+    ("Test.Exceptions", "STACK-present-on-construction"),
 }
 
 # Modules that cannot run yet because a foreign this backend does not supply
@@ -81,10 +85,9 @@ KNOWN_DIVERGENCES = {
 # Each entry must name the missing module, and each must appear as MISSING in
 # the portability index (purescript-julia/bin/portability-index.py). Closing
 # the gap means deleting the line here — nothing else.
-KNOWN_UNSUPPORTED = {
-    "Test.Generic": "Data.Show.Generic — no foreign in runtime/prelude.go",
-    "Test.Transformers": "Effect.Exception — no foreign in runtime/prelude.go "
-                         "(missing on all three backends)",
+KNOWN_UNSUPPORTED: dict[str, str] = {
+    # Empty: both entries (Data.Show.Generic, Effect.Exception) were closed on
+    # 2026-07-30 by authoring the shims in runtime/prelude.go.
 }
 
 TEST_LINE = re.compile(r"^TEST ([^:]+): (.*)$")

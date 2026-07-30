@@ -1111,6 +1111,7 @@ var Control_Monad_ST_Internal_bind_ any = func(a any) any {
 		}
 	}
 }
+
 // foreign map_ (mangles to map__: core "map" is Go-reserved, plus the PS prime _).
 var Control_Monad_ST_Internal_map__ any = func(f any) any {
 	return func(a any) any {
@@ -2083,5 +2084,100 @@ var Trivial_bindEffect any = func(m any) any {
 			a := m.(func() any)()
 			return k.(func(any) any)(a).(func() any)()
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Effect.Exception
+//
+// An Error is a *PSError, and throwException panics with it, so the recover()
+// in catchException gets the same value back. A panic from ANYWHERE else — a
+// Go runtime error, a foreign shim that panicked — is wrapped into a PSError,
+// so a PureScript program can catch what the Go side raises. That is the point
+// of putting exceptions at the standard-library seam rather than per-program.
+//
+// Missing on all three backends until 2026-07-30: the portability index found
+// it once it scanned the union of the backends' package closures instead of
+// just one.
+// ---------------------------------------------------------------------------
+
+type PSError struct {
+	Message string
+	Name    string
+	Cause   any
+}
+
+func (e *PSError) Error() string { return e.Name + ": " + e.Message }
+
+func psErrorOf(v any) *PSError {
+	switch t := v.(type) {
+	case *PSError:
+		return t
+	case error:
+		return &PSError{Message: t.Error(), Name: "Error"}
+	default:
+		return &PSError{Message: fmt.Sprint(v), Name: "Error"}
+	}
+}
+
+var Effect_Exception_error any = func(msg any) any {
+	return &PSError{Message: msg.(string), Name: "Error"}
+}
+var Effect_Exception_errorWithCause any = func(msg any) any {
+	return func(cause any) any {
+		return &PSError{Message: msg.(string), Name: "Error", Cause: cause}
+	}
+}
+var Effect_Exception_errorWithName any = func(msg any) any {
+	return func(nm any) any {
+		return &PSError{Message: msg.(string), Name: nm.(string)}
+	}
+}
+var Effect_Exception_message any = func(e any) any { return psErrorOf(e).Message }
+var Effect_Exception_name any = func(e any) any { return psErrorOf(e).Name }
+var Effect_Exception_showErrorImpl any = func(e any) any {
+	x := psErrorOf(e)
+	return x.Name + ": " + x.Message
+}
+
+// Go attaches no stack to an error VALUE — a stack exists only while panicking
+// — so this is honestly Nothing. That is what the Maybe in
+// `stack :: Error -> Maybe String` is for, and it is a registered divergence
+// from JS, which captures a stack at construction.
+var Effect_Exception_stackImpl any = func(just any) any {
+	return func(nothing any) any {
+		return func(e any) any { return nothing }
+	}
+}
+
+var Effect_Exception_throwException any = func(e any) any {
+	return func() any { panic(e) }
+}
+
+var Effect_Exception_catchException any = func(c any) any {
+	return func(t any) any {
+		return func() (result any) {
+			defer func() {
+				if r := recover(); r != nil {
+					result = c.(func(any) any)(psErrorOf(r)).(func() any)()
+				}
+			}()
+			return t.(func() any)()
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Data.Show.Generic
+// ---------------------------------------------------------------------------
+
+var Data_Show_Generic_intercalate any = func(separator any) any {
+	return func(xs any) any {
+		parts := xs.([]any)
+		strs := make([]string, len(parts))
+		for i, p := range parts {
+			strs[i] = p.(string)
+		}
+		return strings.Join(strs, separator.(string))
 	}
 }

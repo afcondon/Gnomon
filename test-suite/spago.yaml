@@ -12,6 +12,7 @@ package:
     - control
     - effect
     - either
+    - exceptions
     - enums
     - foldable-traversable
     - functions
