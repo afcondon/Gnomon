@@ -8,7 +8,7 @@ measured data and real emitted code** — nothing illustrative.
 - **Eventual home:** the polyglot blog (Halogen + Hylograph viz stack). This doc
   lives with the port so it grows as new chapters land; it migrates to the blog
   when we build it.
-- **Companion to:** `purescript-polyglot/docs/backends/optimizer-ir-vs-handrolled-passes.md`
+- **Companion to:** `afc-work/docs/backends/optimizer-ir-vs-handrolled-passes.md`
   (that post is the *theory* — Path A vs B; this is the *diary* — what actually
   happened).
 - **Source narrative:** `SPIKE-NOTES.md` Session 4. **Source data:** `backend-go/BENCHMARKS.md`.

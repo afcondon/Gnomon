@@ -198,7 +198,7 @@ runs. Ship the staged wins; document what stays boxed and why.
 - **The conformance corpus is the correctness gate for BOTH phases.** Nothing
   lands red. Phase 2 optimizations are only valid if output stays byte-identical.
 - **Reference-hub tie-in.** This build fills the Go column(s) of
-  `purescript-polyglot/docs/backends/backend-comparison.md` (currently stale — it
+  `afc-work/docs/backends/backend-comparison.md` (currently stale — it
   lists Go as "to be added"). Keep that table updated as phases land; the "run the
   same program" strip it calls for **is** the differential corpus. The
   `docs/backends/adding-a-backend.md` guide was effectively validated by the spike.
