@@ -2288,3 +2288,47 @@ var Data_Number_Format_toPrecisionNative any = func(d any) any {
 var Data_Number_Format_toString any = func(num any) any {
 	return _jsNumToString(num.(float64))
 }
+
+// ---------------------------------------------------------------------------
+// Test.Assert
+//
+// Added 2026-07-30 after Gate B4: 29 tests in the compiler's own
+// tests/purs/passing corpus failed on EVERY backend for the single reason that
+// nobody supplied this module's foreign. It was never in our differential
+// corpus's dependency closure, so the portability index never saw it either.
+//
+// These are the most valuable tests upstream ships: the rest of the corpus
+// prints "Done" and proves only that the program ran, while these assert
+// computed values.
+//
+// Mirrors the JS foreign:
+//   assertImpl  :: String -> Boolean -> Effect Unit
+//   checkThrows :: (Unit -> a) -> Effect Boolean
+// An Effect is func() any; the Unit -> a passed to checkThrows takes one
+// argument, hence calling it with nil.
+
+var Test_Assert_assertImpl any = func(message any) any {
+	return func(success any) any {
+		return func() any {
+			if b, ok := success.(bool); !ok || !b {
+				panic(&PSError{Message: message.(string), Name: "Error"})
+			}
+			return nil
+		}
+	}
+}
+
+var Test_Assert_checkThrows any = func(fn any) any {
+	return func() (result any) {
+		defer func() {
+			if r := recover(); r != nil {
+				// JS returns true iff the thrown value is an Error. Under the
+				// Effect.Exception doctrine (ADR-0005) a native Go panic value
+				// is an Error to us, so every recovered case is one.
+				result = true
+			}
+		}()
+		fn.(func(any) any)(nil)
+		return false
+	}
+}
