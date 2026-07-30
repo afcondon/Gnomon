@@ -2181,3 +2181,110 @@ var Data_Show_Generic_intercalate any = func(separator any) any {
 		return strings.Join(strs, separator.(string))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Data.Lazy — a memoizing thunk. `defer` is a Go keyword, so the PureScript
+// name mangles to defer_ (Common.hs keeps the mapping a bijection).
+// ---------------------------------------------------------------------------
+
+var Data_Lazy_defer_ any = func(thunk any) any {
+	var v any
+	forced := false
+	return func() any {
+		if !forced {
+			v = thunk.(func(any) any)(nil)
+			thunk = nil // release the closure, as the JS foreign does
+			forced = true
+		}
+		return v
+	}
+}
+
+var Data_Lazy_force any = func(l any) any { return l.(func() any)() }
+
+// ---------------------------------------------------------------------------
+// Data.Reflectable
+// ---------------------------------------------------------------------------
+
+var Data_Reflectable_unsafeCoerce any = func(x any) any { return x }
+
+// ---------------------------------------------------------------------------
+// Data.Array.ST.Partial — uncurried (STFn2/STFn3), called via runSTFnN. No
+// bounds checking: that is what Partial means here, mirroring the JS foreign's
+// bare xs[i].
+// ---------------------------------------------------------------------------
+
+var Data_Array_ST_Partial_peekImpl any = func(args ...any) any {
+	i := args[0].(int)
+	xs := *(args[1].(*[]any))
+	return xs[i]
+}
+
+var Data_Array_ST_Partial_pokeImpl any = func(args ...any) any {
+	i := args[0].(int)
+	a := args[1]
+	p := args[2].(*[]any)
+	(*p)[i] = a
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Data.Number.Format
+//
+// JS number formatting, which Go's strconv nearly but not exactly matches. The
+// systematic difference is exponent rendering: Go writes e+02 where JS writes
+// e+2. _jsExponent normalises that, and every function here routes through it.
+// ---------------------------------------------------------------------------
+
+// Strip strconv's zero-padded exponent down to JS's minimal form.
+func _jsExponent(s string) string {
+	i := strings.IndexAny(s, "eE")
+	if i < 0 {
+		return s
+	}
+	mantissa, exp := s[:i], s[i+1:]
+	sign := "+"
+	if len(exp) > 0 && (exp[0] == '+' || exp[0] == '-') {
+		sign = string(exp[0])
+		exp = exp[1:]
+	}
+	exp = strings.TrimLeft(exp, "0")
+	if exp == "" {
+		exp = "0"
+	}
+	return mantissa + "e" + sign + exp
+}
+
+var Data_Number_Format_toFixedNative any = func(d any) any {
+	return func(num any) any {
+		return strconv.FormatFloat(num.(float64), 'f', d.(int), 64)
+	}
+}
+
+var Data_Number_Format_toExponentialNative any = func(d any) any {
+	return func(num any) any {
+		return _jsExponent(strconv.FormatFloat(num.(float64), 'e', d.(int), 64))
+	}
+}
+
+var Data_Number_Format_toPrecisionNative any = func(d any) any {
+	return func(num any) any {
+		// JS toPrecision picks fixed or exponential by the decimal exponent:
+		// exponential iff e < -6 or e >= precision. Go's 'g' uses a different
+		// rule, so decide here and format explicitly.
+		f := num.(float64)
+		p := d.(int)
+		if f == 0 {
+			return _jsExponent(strconv.FormatFloat(0, 'f', p-1, 64))
+		}
+		e := int(math.Floor(math.Log10(math.Abs(f))))
+		if e < -6 || e >= p {
+			return _jsExponent(strconv.FormatFloat(f, 'e', p-1, 64))
+		}
+		return strconv.FormatFloat(f, 'f', p-1-e, 64)
+	}
+}
+
+var Data_Number_Format_toString any = func(num any) any {
+	return _jsNumToString(num.(float64))
+}

@@ -46,6 +46,7 @@ TEST_MODULES = [
     "Test.Classes",
     "Test.Dictionaries",
     "Test.Effects",
+    "Test.Formatting",
     "Test.Exceptions",
     "Test.Generic",
     "Test.Maps",

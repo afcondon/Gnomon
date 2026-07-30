@@ -17,6 +17,7 @@ package:
     - foldable-traversable
     - functions
     - integers
+    - lazy
     - lists
     - maybe
     - newtype
