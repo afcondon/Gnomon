@@ -37,16 +37,27 @@ HERE = Path(__file__).resolve().parent
 GO_ROOT = HERE.parent                       # purescript-go/
 OUTPUT_GO = GO_ROOT / "output-go"
 
+# Every Test.* module under src/, benchmarks excluded (Bench* emit no TEST
+# lines). Keep this list complete: six modules sat in src/ unlisted until
+# 2026-07-30, so they had never run in the differential harness at all.
 TEST_MODULES = [
     "Test.ADTs",
     "Test.Arrays",
+    "Test.Classes",
     "Test.Dictionaries",
     "Test.Effects",
+    "Test.Generic",
+    "Test.Maps",
+    "Test.NumLoop",
     "Test.Numbers",
+    "Test.OrderedCollections",
     "Test.PatternMatch",
+    "Test.Records",
     "Test.Recursion",
+    "Test.RecursiveBindings",
     "Test.STTests",
     "Test.Strings",
+    "Test.Transformers",
     "Test.Uncurried",
 ]
 
@@ -60,6 +71,20 @@ KNOWN_DIVERGENCES = {
     ("Test.Strings", "ASTRAL-cu-take-emoji"),
     ("Test.Recursion", "INT64-sumTo-1e6"),
     ("Test.Recursion", "INT64-fact-20"),
+}
+
+# Modules that cannot run yet because a foreign this backend does not supply
+# is missing outright — a GAP, not a divergence and not a regression. Kept in
+# TEST_MODULES so the gap stays visible on every run rather than being deleted
+# and forgotten; reported, but not failed.
+#
+# Each entry must name the missing module, and each must appear as MISSING in
+# the portability index (purescript-julia/bin/portability-index.py). Closing
+# the gap means deleting the line here — nothing else.
+KNOWN_UNSUPPORTED = {
+    "Test.Generic": "Data.Show.Generic — no foreign in runtime/prelude.go",
+    "Test.Transformers": "Effect.Exception — no foreign in runtime/prelude.go "
+                         "(missing on all three backends)",
 }
 
 TEST_LINE = re.compile(r"^TEST ([^:]+): (.*)$")
@@ -147,9 +172,13 @@ def main():
 
     modules = [m for m in TEST_MODULES if args.filter.lower() in m.lower()]
     total = passed = known = 0
-    failures, errors = [], []
+    failures, errors, gaps = [], [], []
 
     for mod in modules:
+        if mod in KNOWN_UNSUPPORTED:
+            gaps.append((mod, KNOWN_UNSUPPORTED[mod]))
+            print(f"{mod}: GAP ({KNOWN_UNSUPPORTED[mod]})", file=sys.stderr)
+            continue
         js_out, js_err = run_js(mod)
         go_out, go_err = run_go(mod)
         if js_err or go_err:
@@ -180,8 +209,8 @@ def main():
         print(f"{mod}: {mod_pass} pass, {mod_fail} fail", file=sys.stderr)
 
     print(f"\n{passed}/{total} identical, {known} known divergences, "
-          f"{len(failures)} failures, {len(errors)} module errors",
-          file=sys.stderr)
+          f"{len(gaps)} unsupported, {len(failures)} failures, "
+          f"{len(errors)} module errors", file=sys.stderr)
     sys.exit(0 if not failures and not errors else 1)
 
 
