@@ -16,6 +16,7 @@ import Data.Number.Format (exponential, fixed, precision, toString, toStringWith
 import Effect (Effect)
 import Effect.Console (log)
 import Effect.Ref as Ref
+import Effect.Unsafe (unsafePerformEffect)
 
 t :: String -> String -> Effect Unit
 t name v = log ("TEST " <> name <> ": " <> v)
@@ -58,10 +59,17 @@ main = do
   t "lazy-force-again" (show (force lazyVal))
   t "lazy-map" (show (force (map (_ + 1) lazyVal)))
 
-  -- memoisation is observable through a Ref: a thunk with an effect in it
-  -- must run once however many times it is forced
-  let counted = defer \_ -> 7
+  -- Memoisation is observable through a Ref: a thunk with an effect in it must
+  -- run ONCE however many times it is forced. The earlier version of this
+  -- block read a counter that nothing ever wrote, so it passed whether or not
+  -- Data.Lazy memoised anything -- it asserted the initial value of a Ref.
+  -- Here the thunk actually increments, and the count is the assertion: three
+  -- forces, one evaluation. A Data.Lazy that re-evaluates reads 3 and fails.
+  let
+    counted = defer \_ -> unsafePerformEffect do
+      Ref.modify_ (_ + 1) counter
+      pure 7
   t "lazy-memo-1" (show (force counted))
   t "lazy-memo-2" (show (force counted + force counted))
   n <- Ref.read counter
-  t "lazy-counter-untouched" (show n)
+  t "lazy-memo-evaluated-once" (show n)
