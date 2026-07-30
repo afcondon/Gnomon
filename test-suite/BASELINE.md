@@ -79,3 +79,37 @@ non-wrap, ASTRAL codepoint-vs-UTF16) — intentional 64-bit/UTF-8 target behavio
 Recursion needed no TCO trampoline (Go's growable stack handled 1M frames); ADR-
 0003 is deferred to Phase 2. Phase 1 = a correct, un-optimized any-runtime
 CoreFn→Go emitter walking the full conformance corpus to green. DONE.
+
+---
+
+## Closed 2026-07-30 — green, and the corpus levelled
+
+The red baseline above is **historical**. It is kept because publishing a red
+baseline rather than waiting for green was the point of ADR-0006, and deleting
+it would erase the evidence that the discipline worked.
+
+Current state, both by `test-suite/run_tests.py` (the oracle lane, ADR-0007):
+
+```
+556/561 identical, 5 known divergences, 0 unsupported, 0 failures, 0 module errors
+```
+
+The 5 are the standing ledger — 2 ASTRAL (code points vs UTF-16 code units),
+2 INT64 (Go `int` does not wrap to 32 bits), 1 STACK (`Effect.Exception.stack`
+is `Nothing`; Go has a stack only while panicking). All three backends now
+report the identical figure, which is the corpus doing its job.
+
+**The corpus is now actually shared.** Until today Gnomon alone had `Classes`,
+`Generic`, `Records`, `Transformers`, `Maps` and `NumLoop`; Pythia and Jurist
+had never compiled a monad transformer stack or a `Generic`-derived instance.
+Those six modules were ported to both siblings and all three sit at 556/561.
+
+**Both runners now discover modules** from `test-suite/src/Test/` instead of
+naming them. Two hand-maintained lists were found stale in this repo alone:
+`run_tests.py` had grown correctly, but `backend-go/run_conformance.sh` listed
+16 of 20 and had been silently skipping `Exceptions`, `Formatting`,
+`OrderedCollections` and `RecursiveBindings`. A list that has to be edited to
+stay honest will eventually not be.
+
+Entry point is now `bin/conformance.sh`, matching the siblings, with the oracle
+and optimizer lanes selectable.

@@ -10,7 +10,10 @@ set -e
 HERE=${0:A:h}
 JSREF="$HERE/../test-suite"
 OUT=/tmp/bgo-conf
-mods=(ADTs Arrays Dictionaries Effects Numbers PatternMatch Recursion Strings STTests Uncurried Records Classes Maps Generic Transformers NumLoop)
+# Corpus modules are DISCOVERED, never listed by hand -- a hand-maintained list
+# is how Test.Maps sat unexecuted in this repo for weeks. Benchmarks are the
+# only exclusion: they measure rather than assert and print no TEST lines.
+mods=(${(f)"$(cd "$JSREF/src/Test" && ls *.purs | sed 's/\.purs$//' | grep -v '^Bench')"})
 
 echo "==> building backend-go"
 (cd "$HERE" && spago build >/dev/null 2>&1)

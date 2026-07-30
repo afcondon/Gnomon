@@ -5,24 +5,39 @@ shadow tells the truth — is the Go member of the polyglot-PureScript
 backends family, alongside [Jurist](../purescript-julia/) (PureScript →
 Julia, *the judge*) and [Pythia](../purescript-python/) (PureScript →
 Python, *the oracle*). The three share the same architecture, the same
-ADR discipline, and the same differential-conformance method over a
-shared `Test.*` corpus.
+ADR discipline ([`docs/design-decisions/`](docs/design-decisions/)), and the
+same differential-conformance method over a genuinely shared `Test.*` corpus.
 
 ## Status
 
-**Phase 1 — reference backend.** The end-to-end differential harness is
-working: `purs corefn,js` → `psgo --entry` (per-module reachability
-pruning) → `go run` → diff against the JS backend. The code generator and
-runtime (`runtime/prelude.go`) produce running Go from CoreFn — see
-`output-go/main.go` for a working artifact and `SPIKE-NOTES.md` for how
-the spike was driven green.
+**Tier 1 — conformant core.** The core language and the core libraries are
+proven byte-for-byte against the JavaScript backend on the shared corpus:
 
-Conformance is at a **documented red baseline** (`test-suite/BASELINE.md`,
-2026-06-13): all 10 corpus modules are red for a single reason — the
-foreign-shim catalogue (`Foreigns.hs`) is not yet authored. The worklist
-is `test-suite/FOREIGN_WORKLIST.txt` (229 distinct foreign functions,
-costed per module). Greening the corpus is the Phase 1 remaining work;
-the two-phase plan is in `PLAN.md`.
+```
+556/561 identical, 5 known divergences, 0 failures     ./bin/conformance.sh
+```
+
+The 5 are the standing ledger (`test-suite/run_tests.py`): 2 ASTRAL, 2 INT64,
+1 STACK. Jurist and Pythia report the identical figure over the identical
+corpus, which is the method working.
+
+**It is not yet a general-purpose backend.** No `Aff`, so every program is
+`Effect`-only and synchronous; ~40 packages exercised, and no measurement of
+what fraction of the registry compiles; `Data.String.Regex` is the one
+outstanding foreign; and a failure surfaces as a Go panic rather than a
+PureScript source position. The gated route out of Tier 1 is
+`docs/kb/architecture/backend-viability.md` in the `docs` repo.
+
+Phase 1 opened at a **documented red baseline** — all modules failing, 229
+unauthored foreign shims (`test-suite/FOREIGN_WORKLIST.txt`). That history is
+kept at the foot of `test-suite/BASELINE.md` rather than deleted: publishing
+red before green was the point of [ADR-0006](docs/design-decisions/0006-conformance-first.md).
+
+There are **two implementations here on purpose** — see
+[ADR-0007](docs/design-decisions/0007-two-implementations.md). `psgo` (`src/`,
+Haskell, raw CoreFn) is the correctness oracle; `backend-go/` (PureScript)
+consumes `purescript-backend-optimizer`'s IR. Both are reachable from
+`bin/conformance.sh`. Correctness claims rest on the oracle.
 
 ## How it works
 
