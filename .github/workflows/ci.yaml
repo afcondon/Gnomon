@@ -1,0 +1,120 @@
+name: CI
+
+# Always triggers so the required `ci-gate` check is always produced; the heavy
+# build is gated on whether non-docs files changed, so a docs-only push still
+# goes green without paying for the toolchain. (Pattern borrowed from the
+# sibling purescript-backend-wasm.)
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Opt JS actions into Node 24 ahead of GitHub's 2026-06-16 default switch,
+  # silencing the Node 20 deprecation warnings (checkout, cache, setup-*, …).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!**/*.pdf'
+              - '!docs/**'
+              - '!CONTRIBUTING.md'
+
+  ci:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOTE: this toolchain setup is best-effort and unvalidated against the
+      # Actions runner — the first CI run may need version pins adjusted. The
+      # conformance LOGIC (bin/conformance.sh) is validated locally.
+      - name: Setup Haskell / Stack
+        uses: haskell-actions/setup@v2
+        with:
+          enable-stack: true
+          stack-version: latest
+
+      # Restore + (later) always-save, rather than actions/cache's combined
+      # form: the combined form only saves in a post-step that is skipped when
+      # the job fails, so a failing run never warms the cache and every run
+      # pays the full cold build. Keyed on the lock file: stack.yaml.lock
+      # controls snapshot reuse, so a hit avoids the ~25-min toolchain rebuild.
+      - name: Restore stack cache (snapshot + work dir)
+        id: stackcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.stack
+            .stack-work
+          key: ${{ runner.os }}-stack-${{ hashFiles('stack.yaml.lock', 'package.yaml') }}
+          restore-keys: ${{ runner.os }}-stack-
+
+      - uses: actions/setup-node@v4
+        with:
+          # next-gen spago imports node:sqlite, usable without a flag only on
+          # Node 24+ (Node 20 throws ERR_UNKNOWN_BUILTIN_MODULE).
+          node-version: "24"
+
+      - name: Setup PureScript (purs + spago)
+        # purs pinned to the repo's compiler; spago is the next-gen (YAML)
+        # client this repo's spago.yaml targets.
+        run: npm install -g purescript@0.15.15 spago@latest
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Conformance lane
+        run: bin/conformance.sh
+
+      # Save even when the lane fails: the expensive part (the cold stack build
+      # of purs-as-library + psgo) has already populated the cache dirs by
+      # this point, and warming them is what makes later runs fast. Skipped on
+      # an exact-key hit (nothing new to save).
+      - name: Save stack cache
+        if: always() && steps.stackcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.stack
+            .stack-work
+          key: ${{ runner.os }}-stack-${{ hashFiles('stack.yaml.lock', 'package.yaml') }}
+
+  # The single required status check. Always runs; green when `ci` passed OR was
+  # skipped (docs-only), red when it failed or was cancelled. Point branch
+  # protection at THIS job if/when the repo enables it.
+  ci-gate:
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the ci result
+        run: |
+          result='${{ needs.ci.result }}'
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            echo "::error::CI did not pass (result: $result)"
+            exit 1
+          fi
+          echo "CI gate green (ci result: $result)"
