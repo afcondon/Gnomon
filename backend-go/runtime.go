@@ -833,7 +833,27 @@ var Data_Number_floor any = func(n any) any { return math.Floor(n.(float64)) }
 
 // JS Math.round rounds half toward +Infinity (= floor(x+0.5)); Go math.Round
 // rounds half away from zero. Mirror JS.
-var Data_Number_round any = func(n any) any { return math.Floor(n.(float64) + 0.5) }
+// Data_Number_round is NOT math.Floor(n+0.5): that is the classic Math.round
+// polyfill bug. Wherever n+0.5 rounds UP in float64 the result is one too high
+// -- round(0.49999999999999994) gave 1 where JS gives 0, and
+// round(4503599627370497) gave ...98 where JS returns its argument. Compare the
+// fraction against 1/2 instead; nothing is added to n.
+var Data_Number_round any = func(n any) any {
+	f := n.(float64)
+	if math.IsInf(f, 0) || math.IsNaN(f) {
+		return f
+	}
+	fl := math.Floor(f)
+	r := fl
+	if f-fl >= 0.5 {
+		r = fl + 1
+	}
+	// JS Math.round(-0.2) is -0, and the sign of zero is observable via 1.0/x.
+	if r == 0 && math.Signbit(f) {
+		return math.Copysign(0, -1)
+	}
+	return r
+}
 var Data_Number_trunc any = func(n any) any { return math.Trunc(n.(float64)) }
 var Data_Number_isFinite any = func(n any) any {
 	f := n.(float64)

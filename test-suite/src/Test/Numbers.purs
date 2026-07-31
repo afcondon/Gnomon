@@ -109,6 +109,22 @@ main = do
   t "num-ceil" (show (Num.ceil (-2.5)))
   t "num-round" (show (Num.round 2.5))
   t "num-round-neg" (show (Num.round (-2.5)))
+  -- Boundary cases for `round`, added 2026-07-31 after two of the three
+  -- backends were found implementing it as `floor(n + 0.5)` -- the classic
+  -- Math.round polyfill bug. That is wrong wherever `n + 0.5` rounds UP in
+  -- float64, and NOTHING in this corpus caught it, because every value anyone
+  -- had thought to test was a comfortable tie. The correct shape compares the
+  -- fraction against 1/2 and adds nothing to n.
+  t "num-round-just-under-half" (show (Num.round 0.49999999999999994))
+  t "num-round-just-under-half-neg" (show (Num.round (-0.49999999999999994)))
+  t "num-round-2pow52-plus1" (show (Num.round 4503599627370497.0))
+  t "num-round-half" (show (Num.round 0.5))
+  t "num-round-half-neg" (show (Num.round (-0.5)))
+  t "num-round-1.5" (show (Num.round 1.5))
+  t "num-round-1.5-neg" (show (Num.round (-1.5)))
+  t "num-round-small-neg" (show (Num.round (-0.2)))
+  t "num-round-integral" (show (Num.round 3.0))
+  t "num-round-large" (show (Num.round 123456789.5))
   t "num-trunc" (show (Num.trunc (-2.7)))
   t "num-sign" (show (Num.sign (-3.0)))
   t "num-pow" (show (Num.pow 2.0 10.0))
