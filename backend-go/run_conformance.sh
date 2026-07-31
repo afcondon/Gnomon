@@ -33,7 +33,11 @@ for m in $mods; do
   nfiles=$(ls "$OUT"/*.go | wc -l | tr -d ' ')
   if diff -q /tmp/js_out.txt /tmp/go_out.txt >/dev/null; then
     echo "[$mod] OK identical ($(wc -l </tmp/go_out.txt|tr -d ' ') lines, $nfiles files)"; pass=$((pass+1))
-  elif diff /tmp/js_out.txt /tmp/go_out.txt | grep -qiE "INT64|ASTRAL"; then
+  # STACK belongs here too: both lanes' Effect.Exception.stackImpl returns
+  # Nothing (neither Go representation carries a stack), and the ORACLE lane
+  # has always ledgered it — this script's narrower pattern was the only reason
+  # Test.Exceptions read as a failure. Keep the two ledgers in step.
+  elif diff /tmp/js_out.txt /tmp/go_out.txt | grep -qiE "INT64|ASTRAL|STACK"; then
     echo "[$mod] OK ledger-only (INT64/ASTRAL, $nfiles files)"; ledger=$((ledger+1))
   else
     echo "[$mod] FAIL:"; diff /tmp/js_out.txt /tmp/go_out.txt | head -8; bad=$((bad+1))

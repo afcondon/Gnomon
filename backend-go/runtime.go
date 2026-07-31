@@ -2355,9 +2355,33 @@ var Data_Array_ST_Partial_pokeImpl any = func(i any) any {
 
 // Number formatting + Regex: no corpus test exercises these; stub so the whole
 // corpus compiles. Replace with faithful impls when a test reaches them.
-var Data_Number_Format_toExponentialNative any = func(_ any) any { panic("backend-go TODO: Data.Number.Format.toExponentialNative") }
-var Data_Number_Format_toFixedNative any = func(_ any) any { panic("backend-go TODO: Data.Number.Format.toFixedNative") }
-var Data_Number_Format_toPrecisionNative any = func(_ any) any { panic("backend-go TODO: Data.Number.Format.toPrecisionNative") }
+var Data_Number_Format_toExponentialNative any = func(d any) any {
+	return func(num any) any {
+		return _jsExponent(strconv.FormatFloat(num.(float64), 'e', d.(int), 64))
+	}
+}
+var Data_Number_Format_toFixedNative any = func(d any) any {
+	return func(num any) any {
+		return strconv.FormatFloat(num.(float64), 'f', d.(int), 64)
+	}
+}
+var Data_Number_Format_toPrecisionNative any = func(d any) any {
+	return func(num any) any {
+		// JS toPrecision picks fixed or exponential by the decimal exponent:
+		// exponential iff e < -6 or e >= precision. Go's 'g' uses a different
+		// rule, so decide here and format explicitly.
+		f := num.(float64)
+		p := d.(int)
+		if f == 0 {
+			return _jsExponent(strconv.FormatFloat(0, 'f', p-1, 64))
+		}
+		e := int(math.Floor(math.Log10(math.Abs(f))))
+		if e < -6 || e >= p {
+			return _jsExponent(strconv.FormatFloat(f, 'e', p-1, 64))
+		}
+		return strconv.FormatFloat(f, 'f', p-1-e, 64)
+	}
+}
 var Data_String_Regex__match any = func(_ any) any { panic("backend-go TODO: Data.String.Regex.match") }
 var Data_String_Regex__replaceBy any = func(_ any) any { panic("backend-go TODO: Data.String.Regex.replaceBy") }
 var Data_String_Regex__search any = func(_ any) any { panic("backend-go TODO: Data.String.Regex.search") }
@@ -2397,4 +2421,38 @@ var Test_Assert_checkThrows any = func(fn any) any {
 		fn.(func(any) any)(nil)
 		return false
 	}
+}
+
+// Two foreigns the oracle lane (runtime/prelude.go) had and this one did not.
+// Found 2026-07-31 by diffing the two runtimes' symbol sets — the drift was
+// only these two, which is worth knowing: the lanes are otherwise in step.
+var Data_Number_Format_toString any = func(num any) any {
+	return _jsNumToString(num.(float64))
+}
+
+var Effect_Exception_errorWithCause any = func(msg any) any {
+	return func(cause any) any {
+		return map[string]any{"message": msg, "name": "Error", "cause": cause}
+	}
+}
+
+// Ported from the oracle lane 2026-07-31 (Test.Formatting): JS renders an
+// exponent with a sign and no leading zeros ("1e+21"); Go emits "1e+21" only
+// after trimming, so normalise here to keep the two lanes byte-identical.
+func _jsExponent(s string) string {
+	i := strings.IndexAny(s, "eE")
+	if i < 0 {
+		return s
+	}
+	mantissa, exp := s[:i], s[i+1:]
+	sign := "+"
+	if len(exp) > 0 && (exp[0] == '+' || exp[0] == '-') {
+		sign = string(exp[0])
+		exp = exp[1:]
+	}
+	exp = strings.TrimLeft(exp, "0")
+	if exp == "" {
+		exp = "0"
+	}
+	return mantissa + "e" + sign + exp
 }
