@@ -1135,6 +1135,7 @@ var Control_Monad_ST_Internal_bind_ any = func(a any) any {
 		}
 	}
 }
+
 // foreign map_ (mangles to map__: core "map" is Go-reserved, plus the PS prime _).
 var Control_Monad_ST_Internal_map__ any = func(f any) any {
 	return func(a any) any {
@@ -2130,9 +2131,9 @@ func _not(a any) any    { return !a.(bool) }
 func _and(a, b any) any { return a.(bool) && b.(bool) }
 func _or(a, b any) any  { return a.(bool) || b.(bool) }
 
-func _intNeg(a any) any     { return -a.(int) }
-func _numNeg(a any) any     { return -a.(float64) }
-func _bitNot(a any) any     { return _toInt32(^a.(int)) }
+func _intNeg(a any) any      { return -a.(int) }
+func _numNeg(a any) any      { return -a.(float64) }
+func _bitNot(a any) any      { return _toInt32(^a.(int)) }
 func _arrayLength(a any) any { return len(a.([]any)) }
 
 func _intAdd(a, b any) any { return a.(int) + b.(int) }
@@ -2271,7 +2272,7 @@ var Effect_Exception_catchException any = func(c any) any {
 }
 
 // Effect / ST ref cells share Phase 1's representation: map[string]any{"value"}.
-func _refNew(v any) any { return map[string]any{"value": v} }
+func _refNew(v any) any  { return map[string]any{"value": v} }
 func _refRead(r any) any { return r.(map[string]any)["value"] }
 func _refWrite(r, v any) any {
 	r.(map[string]any)["value"] = v
@@ -2281,7 +2282,7 @@ func _refWrite(r, v any) any {
 // _runEffect forces an `Effect a` (a `func() any` thunk) to its result.
 func _runEffect(x any) any { return x.(func() any)() }
 
-func _fail(msg string) any { panic(msg) }
+func _fail(msg string) any  { panic(msg) }
 func _todo(what string) any { panic("backend-go: unimplemented IR node: " + what) }
 
 // ---------------------------------------------------------------------------
@@ -2363,3 +2364,37 @@ var Data_String_Regex__search any = func(_ any) any { panic("backend-go TODO: Da
 var Data_String_Regex_flagsImpl any = func(_ any) any { panic("backend-go TODO: Data.String.Regex.flagsImpl") }
 var Data_String_Regex_regexImpl any = func(_ any) any { panic("backend-go TODO: Data.String.Regex.regexImpl") }
 var Data_String_Regex_showRegexImpl any = func(_ any) any { panic("backend-go TODO: Data.String.Regex.showRegexImpl") }
+
+// ---------------------------------------------------------------------------
+// Test.Assert — the corpus's assertion module. Added to THIS lane 2026-07-31;
+// it had been added to psgo's runtime/prelude.go only, so every optimizer-lane
+// program importing Test.Assert failed to link. Errors here are the lane's own
+// map[string]any representation (_exnError), not psgo's PSError.
+//
+// NB checkThrows recovers a panic, which in Go does NOT include stack
+// exhaustion ("goroutine stack exceeded" is a fatal, unrecoverable runtime
+// error). Corpus tests that assert a deep non-tail recursion THROWS therefore
+// cannot pass on Go by exhausting the real stack — see the TCO analysis in
+// docs/kb/research/what-the-other-backends-know.md.
+var Test_Assert_assertImpl any = func(message any) any {
+	return func(success any) any {
+		return func() any {
+			if b, ok := success.(bool); !ok || !b {
+				panic(_exnError(message))
+			}
+			return nil
+		}
+	}
+}
+
+var Test_Assert_checkThrows any = func(fn any) any {
+	return func() (result any) {
+		defer func() {
+			if r := recover(); r != nil {
+				result = true
+			}
+		}()
+		fn.(func(any) any)(nil)
+		return false
+	}
+}
