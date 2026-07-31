@@ -21,6 +21,25 @@ The 5 are the standing ledger (`test-suite/run_tests.py`): 2 ASTRAL, 2 INT64,
 1 STACK. Jurist and Pythia report the identical figure over the identical
 corpus, which is the method working.
 
+### And against the compiler's own test suite
+
+That corpus is one **we wrote**, so it can only prove parity on cases someone
+thought of. `purescript/purescript`'s `tests/purs/passing` is the suite the
+compiler team wrote to *define the language*:
+
+```
+339/347 = 97.7%   tests/purs/passing @ v0.15.15   (purs-corpus/run_corpus.py)
+```
+
+Jurist and Pythia score **exactly the same 339/347**, and 4 of the 6 remaining
+causes are common to more than one backend — the failures are in the shared
+model, not in this lowering. Full analysis:
+`docs/kb/reference/purs-corpus-b4-results.md` in the `docs` repo.
+
+The headline from first contact was **`CODEGEN_ERR` = 0**: across 364 tests
+probing rank-N types, functional dependencies, instance chains, `Coercible`
+and typelevel symbols, nothing made the code generator refuse or crash.
+
 **It is not yet a general-purpose backend.** No `Aff`, so every program is
 `Effect`-only and synchronous; ~40 packages exercised, and no measurement of
 what fraction of the registry compiles; `Data.String.Regex` is the one
