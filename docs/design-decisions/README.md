@@ -19,7 +19,13 @@ backfilled)"; 0007 records a decision visible only in the repo's shape.
 | [0005](0005-ffi-doctrine.md) | FFI doctrine | Accepted |
 | [0006](0006-conformance-first.md) | Conformance-first | Accepted |
 | [0007](0007-two-implementations.md) | Two implementations: oracle + optimizer | Accepted |
+| [0008](0008-unused-pass.md) | The Unused pass; liveness is structural | Accepted |
 
 The family's fuller treatments live in Jurist's `docs/design-decisions/`, which
-Gnomon inherits where it does not diverge — notably ADR-0004 (differential
-conformance) and ADR-0008 (same-seed fuzzing, Proposed).
+Gnomon inherits where it does not diverge — notably **Jurist** ADR-0004
+(differential conformance) and **Jurist** ADR-0008 (same-seed fuzzing,
+Proposed).
+
+**Numbering is per-repo.** Jurist ADR-0008 (fuzzing) and Gnomon ADR-0008 (the
+Unused pass) are unrelated documents that happen to share an index; always name
+the repo when citing one from outside it.
