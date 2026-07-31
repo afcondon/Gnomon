@@ -31,6 +31,8 @@ module Language.PureScript.Go.CodeGen
 
 import Prelude
 
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -82,7 +84,7 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
         GoCurriedApp (genExpr fn) (genExpr arg)
 
       CoreFn.Let _ binds body ->
-        GoIIFE (concatMap genLetBind binds ++ [ GoReturn (genExpr body) ])
+        GoIIFE (genLetGroup binds body ++ [ GoReturn (genExpr body) ])
 
       CoreFn.Case _ scruts alts ->
         genCase scruts alts
@@ -128,12 +130,31 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
 
     -- | Let bindings -> statements. Local recursion via closure capture
     -- (Go closures capture by reference). TCO for local @go@ deferred.
-    genLetBind :: CoreFn.Bind CoreFn.Ann -> [GoStmt]
-    genLetBind (CoreFn.NonRec _ ident expr) =
+    -- | A whole @let@ group. Each binding is emitted knowing what can still
+    -- refer to it: every LATER binding's right-hand side, plus the let body.
+    -- (A binding is routinely used only by its successor, never by the body —
+    -- scoping by body alone would wrongly drop it.)
+    genLetGroup :: [CoreFn.Bind CoreFn.Ann] -> CoreFn.Expr CoreFn.Ann -> [GoStmt]
+    genLetGroup binds body = concat (zipWith genLetBind laterUses binds)
+      where
+        laterUses =
+          [ Set.unions (usedIdents body : map bindUsedIdents (drop (i + 1) binds))
+          | i <- [0 .. length binds - 1] ]
+
+    genLetBind :: Set P.Ident -> CoreFn.Bind CoreFn.Ann -> [GoStmt]
+    genLetBind used (CoreFn.NonRec _ ident expr)
+      -- Unused let binding: Go rejects the declaration, but the RHS must STILL
+      -- be evaluated — the JS reference evaluates it, so a divergent or
+      -- throwing RHS has to diverge or throw here too. Assigning to the blank
+      -- identifier keeps the evaluation and drops the binding. (Unlike a
+      -- pattern binder, a let RHS is an arbitrary expression, so deleting it
+      -- outright would not be semantics-preserving.)
+      | not (ident `Set.member` used) =
+          [ GoRawStmt ("_ = " <> prettyOf (genExpr expr)) ]
       -- `var x any = ...`, not `x := ...`: forces interface type so a later
       -- `x.(func(any) any)(arg)` works even when the RHS is a closure literal.
-      [ GoVarDef (identToGoName ident) (genExpr expr) ]
-    genLetBind (CoreFn.Rec bindings) =
+      | otherwise = [ GoVarDef (identToGoName ident) (genExpr expr) ]
+    genLetBind _ (CoreFn.Rec bindings) =
       -- Declare-then-assign so self/mutual refs resolve (Go := would not allow
       -- forward ref within a block). Use var + reassign.
       [ GoRawStmt ("var " <> identToGoName ident <> " any") | ((_, ident), _) <- bindings ] ++
@@ -147,24 +168,37 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
     genCase scruts alts =
       let roots = [ GoVar ("_v" <> tshow i) | i <- [0 .. length scruts - 1] ]
           altStmts = concatMap (genAlt roots) alts
-          -- A scrutinee that no pattern actually references must NOT be bound:
-          -- Go treats an unused `:=` local as a compile error. Scrutinees are
-          -- pure CoreFn expressions, so dropping an unreferenced binding is
-          -- semantics-preserving. (Minimal inline form of the Unused pass.)
-          altText = T.concat (map prettyStmtOf altStmts)
+          -- A scrutinee no pattern actually needs must NOT be bound: Go treats
+          -- an unused local as a compile error. Decided STRUCTURALLY over the
+          -- CoreFn binders (`rootLive`) rather than by scanning rendered Go for
+          -- a `_v<i>` token — the scan is blind to scope, so a nested case
+          -- reusing `_v0` kept the outer root alive (test `Guards`).
+          --
+          -- Dropping is semantics-preserving because a scrutinee whose root is
+          -- dead is one that no alternative tests or binds, and CoreFn case
+          -- scrutinees are pure. `usedIdents` applies the SAME predicate, so a
+          -- let binding that only fed a dead root goes dead too (test `3388`) —
+          -- that is the fixpoint, obtained by agreeing on one liveness rule
+          -- instead of iterating.
           scrutBindings =
             [ GoAssign ("_v" <> tshow i) (genExpr e)
             | (i, e) <- zip [0 :: Int ..] scruts
-            , rootUsed i altText ]
+            , rootLive i alts ]
           failStmt = GoPanic ("Pattern match failed in module " <> escapeGoString currentModuleText)
       in GoIIFE (scrutBindings ++ altStmts ++ [ failStmt ])
 
     -- | One alternative -> an @if cond { binders; return body }@ block.
     genAlt :: [GoExpr] -> CoreFn.CaseAlternative CoreFn.Ann -> [GoStmt]
-    genAlt roots (CoreFn.CaseAlternative binders result) =
+    genAlt roots alt@(CoreFn.CaseAlternative binders result) =
       let patResults = zipWith genPattern roots binders
           conds = concatMap fst patResults
-          binds = concatMap snd patResults
+          -- Drop pattern binders the alternative never references: Go rejects an
+          -- unused local outright. Safe to DELETE rather than blank-assign,
+          -- because a pattern bind's RHS is always a pure projection out of an
+          -- already-evaluated scrutinee (`_v0`, `_v1.(V).Fields[0]`) guarded by
+          -- the tag check that precedes it — no effect, no panic, to preserve.
+          used = Set.map identToGoName (altUsedIdents alt)
+          binds = [ s | s <- concatMap snd patResults, goBindUsed used s ]
           bodyStmts = case result of
             Right body -> binds ++ [ GoReturn (genExpr body) ]
             Left guards ->
@@ -267,20 +301,107 @@ tshow = T.pack . show
 prettyOf :: GoExpr -> Text
 prettyOf = Pretty.prettyExpr
 
--- | Render a GoStmt to text (used to scan for scrutinee-root usage).
-prettyStmtOf :: GoStmt -> Text
-prettyStmtOf = Pretty.prettyStmt
-
--- | Does scrutinee root @_v<i>@ appear in the rendered alternatives? Matches
--- the exact token (not followed by a digit, so @_v1@ does not match @_v10@).
-rootUsed :: Int -> Text -> Bool
-rootUsed i txt = scan txt
+-- | Every LOCAL identifier referenced anywhere in an expression.
+--
+-- This is the Unused pass's oracle (ADR-0003 deferred it; Gate B4 forced it).
+-- Go rejects an unused local with "declared and not used", so a pattern binder
+-- or let binding the body never mentions is a COMPILE ERROR, not a warning.
+--
+-- Deliberately IGNORES SHADOWING and so over-approximates: an inner binding
+-- that reuses a name still counts as a reference to the outer one. That errs in
+-- the only safe direction — a retained-but-unused binder reproduces today's
+-- error (no regression), whereas a dropped-but-used binder would be a
+-- miscompile. Module-qualified refs are top-level and never locals, so they are
+-- skipped.
+usedIdents :: CoreFn.Expr CoreFn.Ann -> Set P.Ident
+usedIdents = go
   where
-    tok = "_v" <> tshow i
-    scan t = case T.breakOn tok t of
-      (_, "") -> False
-      (_, rest) ->
-        let after = T.drop (T.length tok) rest
-        in case T.uncons after of
-             Just (c, _) | c >= '0' && c <= '9' -> scan (T.drop (T.length tok) rest)
-             _ -> True
+    go :: CoreFn.Expr CoreFn.Ann -> Set P.Ident
+    go = \case
+      CoreFn.Var _ (P.Qualified (P.BySourcePos _) ident) -> Set.singleton ident
+      CoreFn.Var _ _ -> Set.empty
+      CoreFn.Literal _ lit -> goLit lit
+      CoreFn.Constructor{} -> Set.empty
+      CoreFn.Accessor _ _ e -> go e
+      CoreFn.ObjectUpdate _ e _ fs -> Set.union (go e) (Set.unions (map (go . snd) fs))
+      CoreFn.Abs _ _ body -> go body
+      CoreFn.App _ f a -> Set.union (go f) (go a)
+      -- Only a LIVE scrutinee counts as a use of the names inside it: an
+      -- alternative that neither tests nor binds position i means scrutinee i
+      -- is never emitted, so whatever it referenced may itself be dead. Same
+      -- predicate genCase uses, which is what makes the two agree.
+      CoreFn.Case _ scruts alts ->
+        Set.unions
+          ( [ go e | (i, e) <- zip [0 :: Int ..] scruts, rootLive i alts ]
+            ++ map goAlt alts )
+      CoreFn.Let _ binds body ->
+        Set.unions (go body : map goBind binds)
+
+    goAlt :: CoreFn.CaseAlternative CoreFn.Ann -> Set P.Ident
+    goAlt (CoreFn.CaseAlternative _ result) = case result of
+      Right body -> go body
+      Left guards -> Set.unions [ Set.union (go g) (go b) | (g, b) <- guards ]
+
+    goBind :: CoreFn.Bind CoreFn.Ann -> Set P.Ident
+    goBind (CoreFn.NonRec _ _ e) = go e
+    goBind (CoreFn.Rec bs) = Set.unions [ go e | (_, e) <- bs ]
+
+    goLit :: CoreFn.Literal (CoreFn.Expr CoreFn.Ann) -> Set P.Ident
+    goLit = \case
+      CoreFn.ArrayLiteral es -> Set.unions (map go es)
+      CoreFn.ObjectLiteral fs -> Set.unions (map (go . snd) fs)
+      _ -> Set.empty
+
+-- | Keep a pattern-binder statement only if its bound Go name is referenced.
+-- Anything that is not a plain binder assignment is always kept.
+goBindUsed :: Set Text -> GoStmt -> Bool
+goBindUsed used = \case
+  GoAssign n _ -> n `Set.member` used
+  _            -> True
+
+-- | Does a binder still NEED its scrutinee once unused binds are dropped?
+--
+-- True iff it tests the value (any condition is emitted) or binds a name the
+-- alternative actually uses. This is the structural replacement for scanning
+-- rendered Go for a @_v<i>@ token: the text scan cannot see scope, so a NESTED
+-- case reusing @_v0@ made the OUTER root look live (test `Guards`).
+binderLive :: Set P.Ident -> CoreFn.Binder CoreFn.Ann -> Bool
+binderLive used = \case
+  CoreFn.NullBinder _ -> False
+  CoreFn.VarBinder _ ident -> ident `Set.member` used
+  CoreFn.NamedBinder _ ident inner ->
+    ident `Set.member` used || binderLive used inner
+  CoreFn.ConstructorBinder ann _ _ subs -> case ann of
+    -- A newtype ctor emits no tag check — it is erased to its inner binder.
+    (_, _, Just CoreFn.IsNewtype) -> any (binderLive used) subs
+    _ -> True  -- the tag check is a real condition
+  CoreFn.LiteralBinder _ lit -> litBinderLive used lit
+
+-- | Record patterns emit NO condition (only field projections), so a record
+-- pattern binding nothing used is entirely dead — that is test `3388`, where
+-- `let { a, b } = x { a = 43 }` with `a`/`b` unused leaves the scrutinee dead.
+-- Every other literal binder emits an equality or length check.
+litBinderLive :: Set P.Ident -> CoreFn.Literal (CoreFn.Binder CoreFn.Ann) -> Bool
+litBinderLive used = \case
+  CoreFn.ObjectLiteral fields -> any (binderLive used . snd) fields
+  _ -> True
+
+-- | Is scrutinee root @i@ needed by any alternative?
+rootLive :: Int -> [CoreFn.CaseAlternative CoreFn.Ann] -> Bool
+rootLive i alts = any live alts
+  where
+    live alt@(CoreFn.CaseAlternative binders _) =
+      case drop i binders of
+        (b : _) -> binderLive (altUsedIdents alt) b
+        []      -> False
+
+-- | The identifiers referenced by a bind group's right-hand sides.
+bindUsedIdents :: CoreFn.Bind CoreFn.Ann -> Set P.Ident
+bindUsedIdents (CoreFn.NonRec _ _ e) = usedIdents e
+bindUsedIdents (CoreFn.Rec bs) = Set.unions [ usedIdents e | (_, e) <- bs ]
+
+-- | The identifiers an alternative's RESULT (body, or all its guards) uses.
+altUsedIdents :: CoreFn.CaseAlternative CoreFn.Ann -> Set P.Ident
+altUsedIdents (CoreFn.CaseAlternative _ result) = case result of
+  Right body -> usedIdents body
+  Left guards -> Set.unions [ Set.union (usedIdents g) (usedIdents b) | (g, b) <- guards ]
