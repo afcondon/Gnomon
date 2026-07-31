@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -442,13 +443,17 @@ var Data_Ord_ordIntImpl any = _mkOrd(func(x, y any) int {
 })
 var Data_Ord_ordNumberImpl any = _mkOrd(func(x, y any) int {
 	a, b := x.(float64), y.(float64)
+	// Mirror the reference structure exactly -- `x < y ? lt : x === y ? eq :
+	// gt` -- rather than the equivalent-looking `<` / `>` / else. They part
+	// company on NaN, which is neither less nor equal, so JS falls through to
+	// GT where a `>` test falls through to EQ. `compare NaN 1.0` is GT.
 	if a < b {
 		return -1
 	}
-	if a > b {
-		return 1
+	if a == b {
+		return 0
 	}
-	return 0
+	return 1
 })
 var Data_Ord_ordStringImpl any = _mkOrd(func(x, y any) int {
 	a, b := x.(string), y.(string)
@@ -788,11 +793,28 @@ var Data_Int_toNumber any = func(n any) any { return float64(n.(int)) }
 // quot/rem: truncating division (toward zero); Go int division already
 // truncates toward zero. pow: Math.pow then ToInt32 (the `| 0`). toStringAs:
 // radix conversion (lowercase digits, like JS Number.prototype.toString).
+// Both guard zero, which Go does not: `x / 0` panics where JS's `x / 0 | 0`
+// is 0. The reference for `quot` is exactly that -- Infinity coerced through
+// ToInt32 -- so 0 is the right answer and not merely a safe one. `rem` is
+// different: JS `x % 0` is NaN, which is not an Int at all, so no non-JS
+// backend can reproduce it and all three return 0. That is a ledger entry
+// (int-rem-zero), not a bug. Found by Test.Boundaries; before it, both
+// panicked.
 var Data_Int_quot any = func(x any) any {
-	return func(y any) any { return x.(int) / y.(int) }
+	return func(y any) any {
+		if y.(int) == 0 {
+			return 0
+		}
+		return x.(int) / y.(int)
+	}
 }
 var Data_Int_rem any = func(x any) any {
-	return func(y any) any { return x.(int) % y.(int) }
+	return func(y any) any {
+		if y.(int) == 0 {
+			return 0
+		}
+		return x.(int) % y.(int)
+	}
 }
 var Data_Int_pow any = func(x any) any {
 	return func(y any) any {
@@ -861,16 +883,41 @@ var Data_Number_isFinite any = func(n any) any {
 }
 
 // fromStringImpl(str, isFinite, just, nothing): uncurried (called via runFn4).
-// JS parseFloat is lenient (parses a leading numeral); strconv is strict, so a
-// trailing-junk input that JS would accept diverges here.
+// `Data.Number.fromString` is `parseFloat` behind an isFinite guard, and
+// parseFloat is a PREFIX parser: it skips leading whitespace, takes the
+// longest numeric prefix and ignores the rest. So "1.5x" is 1.5, "0x10" is 0
+// (it stops at the `x`), " 1.5 " is 1.5 and "1_000" is 1 -- where Go's
+// strconv accepts the underscore and answers 1000. Found by Test.Boundaries.
+var _floatPrefix = regexp.MustCompile(
+	`^[\s]*[+-]?(?:Infinity|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)`)
+
+func _parseFloat(s string) float64 {
+	m := _floatPrefix.FindString(s)
+	if m == "" {
+		return math.NaN()
+	}
+	t := strings.TrimSpace(m)
+	if strings.HasSuffix(t, "Infinity") {
+		if strings.HasPrefix(t, "-") {
+			return math.Inf(-1)
+		}
+		return math.Inf(1)
+	}
+	f, err := strconv.ParseFloat(t, 64)
+	if err != nil {
+		return math.NaN()
+	}
+	return f
+}
+
 var Data_Number_fromStringImpl any = func(args ...any) any {
-	num, err := strconv.ParseFloat(args[0].(string), 64)
+	num := _parseFloat(args[0].(string))
 	isFinite := args[1].(func(any) any)
 	just := args[2].(func(any) any)
 	nothing := args[3]
-	if err != nil {
-		return nothing
-	}
+	// No error path: _parseFloat answers NaN where parseFloat does, and the
+	// isFinite guard is what turns that into Nothing -- exactly as the JS
+	// foreign does.
 	if isFinite(num).(bool) {
 		return just(num)
 	}
@@ -894,8 +941,26 @@ var Data_Number_tan any = func(n any) any { return math.Tan(n.(float64)) }
 var Data_Number_atan2 any = func(y any) any {
 	return func(x any) any { return math.Atan2(y.(float64), x.(float64)) }
 }
+
+// ECMAScript Math.pow is NOT IEEE pow, and the order of its rules matters:
+// an exponent of zero wins over a NaN base, but a NaN exponent beats
+// everything else, and |base| == 1 with an infinite exponent is NaN where
+// IEEE says 1. Go's math.Pow follows IEEE, so the two special cases have to
+// be layered on top. Found by Test.Boundaries.
 var Data_Number_pow any = func(n any) any {
-	return func(p any) any { return math.Pow(n.(float64), p.(float64)) }
+	return func(p any) any {
+		b, e := n.(float64), p.(float64)
+		if e == 0 {
+			return 1.0
+		}
+		if math.IsNaN(e) {
+			return math.NaN()
+		}
+		if math.Abs(b) == 1 && math.IsInf(e, 0) {
+			return math.NaN()
+		}
+		return math.Pow(b, e)
+	}
 }
 var Data_Number_remainder any = func(n any) any {
 	return func(m any) any { return math.Mod(n.(float64), m.(float64)) }

@@ -94,6 +94,14 @@ replaceBasicEscape '\f' = "\\f"
 replaceBasicEscape '\r' = "\\r"
 replaceBasicEscape '"'  = "\\\""
 replaceBasicEscape '\\' = "\\\\"
+-- Every OTHER control character has to be escaped too, not passed through.
+-- Go rejects a raw NUL in a source file outright ("invalid NUL character"),
+-- and the rest are at best invisible in the output. Passing them through was
+-- safe only for as long as nothing wrote one: `Test.Boundaries` asks for
+-- `'\x0'` and psgo emitted a literal NUL byte into main.go, which failed to
+-- compile. Named escapes above stay named because they read better.
+replaceBasicEscape c
+  | c < ' ' || c == '\DEL' = "\\u" <> hex 4 c
 replaceBasicEscape c    = singleton c
 
 -- | Escape plain Text for a Go string literal body.

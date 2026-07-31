@@ -85,6 +85,58 @@ KNOWN_DIVERGENCES = {
     # STACK-: JS captures a stack when an Error is CONSTRUCTED; Go has a stack
     # only while panicking, never on an error value. `Maybe` is the honest type.
     ("Test.Exceptions", "STACK-present-on-construction"),
+    # ---- Test.Boundaries -------------------------------------------
+    # The boundary tables are a systematic enumeration, so unlike the
+    # rest of the corpus they are EXPECTED to turn up divergences: that
+    # is what they are for. Each one below has been triaged to a cause,
+    # and anything that turned out to be a bug was fixed rather than
+    # listed -- nine of them were, including three crashes.
+    #
+    # INT32: JS wraps every Int operation to int32 (`|0`); these
+    # backends run wider arithmetic, so the JS values here are the
+    # OVERFLOWED ones. `topInt`/`bottomInt` are `foreign import`s that
+    # every backend chooses, and all three copied JS's while running
+    # wider arithmetic underneath -- which is the whole of the
+    # incoherence, and Gate C9's to settle.
+    ("Test.Boundaries", "int-top-plus-1"),
+    ("Test.Boundaries", "int-bottom-minus-1"),
+    ("Test.Boundaries", "int-negate-bottom"),
+    ("Test.Boundaries", "int-abs-bottom"),
+    ("Test.Boundaries", "int-negate-bottom-gt-top"),
+    ("Test.Boundaries", "int-top-times-2"),
+    ("Test.Boundaries", "int-bottom-times-2"),
+    ("Test.Boundaries", "int-top-plus-top"),
+    ("Test.Boundaries", "int-top-times-top"),
+    ("Test.Boundaries", "int-quot-bottom-by-neg1"),
+    ("Test.Boundaries", "int-lcm-top-top"),
+    # REM0: `Int.rem x 0` is NaN on JS -- a value that is not an Int at
+    # all. No backend with a real integer type can reproduce it; all
+    # three answer 0.
+    ("Test.Boundaries", "int-rem-zero"),
+    # NEGZERO: `purs`'s JS backend INLINES `Data.Ring.negate` to unary
+    # minus, so `-0.0` there is a genuine negative zero. `negate` is not
+    # a class member -- it is `negate a = zero - a` in the Prelude -- so
+    # a faithful CoreFn lowering computes `0.0 - 0.0`, which IEEE says
+    # is POSITIVE zero. Everything below follows from that one
+    # difference, and the sign of a zero is observable through `1/x`,
+    # `atan2`, `min`/`max` and `pow`. Not a shim bug: there is no shim
+    # to fix. Closing it means matching the inliner in each codegen.
+    ("Test.Boundaries", "num-sign-of-negzero"),
+    ("Test.Boundaries", "num-sign-of-negzero-plus-negzero"),
+    ("Test.Boundaries", "num-sign-of-sqrt-negzero"),
+    ("Test.Boundaries", "num-min-zeros"),
+    ("Test.Boundaries", "num-pow-negzero-neg1"),
+    ("Test.Boundaries", "num-atan2-zero-negzero"),
+    # ASTRAL: JS counts UTF-16 code units; these backends count
+    # codepoints. Identical for BMP text.
+    ("Test.Boundaries", "char-astral-length"),
+    ("Test.Boundaries", "char-astral-take-1"),
+    ("Test.Boundaries", "char-astral-take-2"),
+    # SURROGATE: a Go string is UTF-8 and cannot hold a lone
+    # surrogate, so one round-trips as U+FFFD. Structural, not a
+    # shim choice.
+    ("Test.Boundaries", "char-fromCharCode-high-surrogate"),
+    ("Test.Boundaries", "char-fromCharCode-low-surrogate"),
 }
 
 # Modules that cannot run yet because a foreign this backend does not supply
