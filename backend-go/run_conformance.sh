@@ -36,11 +36,21 @@ pass=0; ledger=0; bad=0
 for m in $mods; do
   mod="Test.$m"
   rm -rf "$OUT"
-  (cd "$HERE" && spago run -- --corefn-dir "$JSREF/output" --output-dir "$OUT" --main "$mod" >/dev/null 2>&1)
+  # The emit step and the JS reference step are guarded rather than bare. Both
+  # used to run under `set -e` with their output silenced, so a failure in
+  # either killed the whole lane mid-loop having printed NOTHING about it — the
+  # log simply stopped after the previous module's OK line. That is a gate that
+  # can fail invisibly, which is the same fault as a gate that passes
+  # invisibly. Report it against the module, count it bad, keep going.
+  if ! (cd "$HERE" && spago run -- --corefn-dir "$JSREF/output" --output-dir "$OUT" --main "$mod" >/dev/null 2>"$TMPD/emit_err.txt"); then
+    echo "[$mod] EMIT-ERR: $(grep -v '^$' "$TMPD/emit_err.txt" | tail -1 | head -c 160)"; bad=$((bad+1)); continue
+  fi
   cp "$HERE/runtime.go" "$OUT/runtime.go"
   if ! (cd "$OUT" && go build -o "$TMPD/bgo_bin" *.go 2>"$TMPD/be.txt"); then echo "[$mod] BUILD-ERR: $(head -3 "$TMPD/be.txt" | tail -1)"; bad=$((bad+1)); continue; fi
   if ! "$TMPD/bgo_bin" > "$TMPD/go_out.txt" 2>"$TMPD/go_err.txt"; then echo "[$mod] RUN-ERR: $(grep -m1 panic "$TMPD/go_err.txt")"; bad=$((bad+1)); continue; fi
-  node --input-type=module -e "import(\"$JSREF/output/$mod/index.js\").then(x => x.main())" > "$TMPD/js_out.txt" 2>/dev/null
+  if ! node --input-type=module -e "import(\"$JSREF/output/$mod/index.js\").then(x => x.main())" > "$TMPD/js_out.txt" 2>"$TMPD/js_err.txt"; then
+    echo "[$mod] JSREF-ERR: $(grep -v '^$' "$TMPD/js_err.txt" | tail -1 | head -c 160)"; bad=$((bad+1)); continue
+  fi
   nfiles=$(ls "$OUT"/*.go | wc -l | tr -d ' ')
   if diff -q "$TMPD/js_out.txt" "$TMPD/go_out.txt" >/dev/null; then
     echo "[$mod] OK identical ($(wc -l <"$TMPD/go_out.txt"|tr -d ' ') lines, $nfiles files)"; pass=$((pass+1))
