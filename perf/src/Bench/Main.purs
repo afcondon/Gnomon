@@ -68,7 +68,18 @@ type Shape =
 -- |
 -- | **Why `fold-array` shares those sizes.** It is `fold-list`'s control —
 -- | same numbers, same sum, same checksum, different representation walked.
--- | Comparing them at different n would compare nothing.
+-- | Comparing them at different n would compare nothing. It stays uncapped
+-- | and ungated for that reason: it is a control, not a subject, and array
+-- | traversal is gated through `map-array` instead.
+-- |
+-- | **Why `ffi-array` and `string-join` reach 12800.** The runner only gates
+-- | a shape at its largest n and only above an absolute floor, because below
+-- | that scheduler noise dominates (see `GATE_MIN_STEADY_US` in
+-- | `run_perf.py`). At 1600 both of these land around 12–20 us on the JS
+-- | reference, so *neither was gated on any backend* — and `ffi-array` is
+-- | one of the two shapes that measure the FFI axis this corpus was built
+-- | around. A shape that cannot fail the gate is not protected by it. 12800
+-- | puts both comfortably clear at a cost of well under a millisecond.
 -- |
 -- | `reps` is small everywhere. Steady state is a min-of-reps and min
 -- | converges fast; more reps would buy precision on the axis that is not in
@@ -82,9 +93,9 @@ shapes =
   , { name: "ffi-call", sizes: [ 100, 1000, 10000 ], reps: 5, run: S.ffiCall }
   , { name: "record-update", sizes: [ 100, 1000, 10000 ], reps: 5, run: S.recordUpdate }
   , { name: "map-array", sizes: [ 100, 400, 1600 ], reps: 5, run: S.mapArray }
-  , { name: "string-join", sizes: [ 100, 400, 1600 ], reps: 5, run: S.stringJoin }
+  , { name: "string-join", sizes: [ 100, 400, 1600, 12800 ], reps: 5, run: S.stringJoin }
   , { name: "string-append", sizes: [ 100, 400, 1600 ], reps: 3, run: S.stringAppend }
-  , { name: "ffi-array", sizes: [ 100, 400, 1600 ], reps: 5, run: S.ffiArray }
+  , { name: "ffi-array", sizes: [ 100, 400, 1600, 12800 ], reps: 5, run: S.ffiArray }
   -- The pair, at shared sizes: the ADT probe and its flat control.
   , { name: "fold-array", sizes: [ 10, 25, 50, 100 ], reps: 5, run: S.foldArray }
   , { name: "fold-list", sizes: [ 10, 25, 50, 100 ], reps: 5, run: S.foldList }

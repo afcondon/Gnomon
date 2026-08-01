@@ -24,3 +24,6 @@ node_modules/
 # OS
 .DS_Store
 .direnv/
+
+# Python bytecode (perf/run_perf.py)
+__pycache__/

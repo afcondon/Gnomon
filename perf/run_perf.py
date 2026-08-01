@@ -62,13 +62,53 @@ SCHEMA = "1"
 # cheapest thing that still touches the whole representation — a host loop, a
 # closure call and a Ref write per iteration — so it tracks general runtime
 # speed without tracking any one shape's pathology.
-CALIBRATION = ("loop-fore", 1000)
+#
+# The SIZE matters as much as the shape, and n=1000 was the wrong one. At five
+# reps that is six thousand iterations, which is not enough work for a tiering
+# JIT to finish tiering: JS steady at n=1000 was measured at 114, 135, 167,
+# 188 and 196 us on the same machine on the same day. A calibration that moves
+# by 1.7x moves every ratio derived from it by 1.7x, so the noise floor of the
+# whole lane was set by its own denominator. n=10000 is ten times the work and
+# lands past the warm-up on every runtime measured. The tell that this was
+# real: loop-fore@10000 read rel 10.4 on Jurist (linear in n, as a host loop
+# should be) but 6.3 on JS — not because the JS loop is sublinear, but because
+# its denominator was too slow.
+CALIBRATION = ("loop-fore", 10000)
 
-# How far a ratio may move before it is reported. Deliberately loose to start
-# with: this lane has no variance history yet, and a canary that cries wolf
-# gets muted, which is strictly worse than one that is slightly deaf. Tighten
-# once a few weeks of runs say what the real noise is.
+# How far a ratio may move before it is reported. This now has a measurement
+# behind it rather than a guess: six back-to-back runs of all three backends
+# on an idle M4 MBP, 2026-08-01. Over the GATED population (see below) the
+# worst run-to-run spread was 1.69x, the 90th percentile 1.21x and the median
+# 1.10x — so 2.0 leaves 1.18x of headroom over the worst thing noise did in
+# six tries, and still catches any regression of 2x or more.
+#
+# The number did not need to change; the population did. Over ALL measured
+# rows the worst spread was 5.74x, so a 2.0 gate applied to everything would
+# have fired on noise more or less every run. That is the whole finding.
+#
+# Tighten toward the 90th percentile once a few weeks of CI runs say what the
+# tail really looks like — six samples underestimate it.
 TOLERANCE = 2.0
+
+# Two filters decide whether a row is GATED (counts toward failure) or merely
+# reported. Both express the same idea: a measurement has to carry information
+# before it is allowed to fail a build.
+#
+#   1. Only the largest n of each shape. The smaller sizes are there to show
+#      the CURVE — superlinearity, and f/s growing with n, which is the
+#      type-nesting signal. A curve point is a diagnostic, not a threshold.
+#   2. Only shapes whose steady time clears this floor. Below it, scheduler
+#      noise and timer resolution dominate: `ffi-array@1600` on the JS
+#      reference is ~20 us and swings 1.5x between runs while doing exactly
+#      the same work.
+#
+# The floor is absolute because the things it guards against are absolute. It
+# is therefore a property of the machine that RECORDED the baseline, and the
+# decision travels with the baseline rather than being recomputed per run —
+# otherwise a shape sitting near the line would gate on one run and not the
+# next. On a slower machine this excludes rows that would have been
+# measurable there, which loses a little coverage and never invents an alarm.
+GATE_MIN_STEADY_US = 50.0
 
 BENCH_RE = re.compile(
     r"^BENCH (\S+) (\d+) ([-\d.eE+]+) ([-\d.eE+]+) (-?\d+)\s*$"
@@ -233,15 +273,20 @@ def derive(rows, who):
     if base <= 0.0:
         sys.exit(f"{who}: calibration shape measured as {base} us — "
                  "clock resolution too coarse to normalise against")
+    largest = {}
+    for shape, n in rows:
+        largest[shape] = max(largest.get(shape, 0), n)
     out = {}
     for key, v in rows.items():
         steady = v["steady"]
+        shape, n = key
         out[key] = {
             **v,
             "rel": steady / base,
             # A steady time at or below clock resolution makes f/s
             # meaningless rather than large; report it as absent.
             "fs": (v["first"] / steady) if steady > 0.0 else None,
+            "gated": n == largest[shape] and steady >= GATE_MIN_STEADY_US,
         }
     return out, base
 
@@ -273,20 +318,30 @@ def check_checksums(results):
 
 
 def check_baseline(results, baseline):
-    """Drift against the recorded ratios. Report; gating is the caller's call."""
-    drifts = []
+    """Drift against the recorded ratios.
+
+    Returns (drifts, n_gated). Each drift carries whether it is gated, and
+    gatedness comes from the BASELINE, not from this run — see the comment on
+    GATE_MIN_STEADY_US for why the decision has to be the fixed one.
+    """
+    drifts, n_gated = [], 0
     for backend, rows in results.items():
         recorded = baseline.get("backends", {}).get(backend)
         if recorded is None:
             drifts.append((backend, None, None,
-                           "no baseline recorded for this backend"))
+                           "no baseline recorded for this backend", True))
             continue
         for key in sorted(rows):
             name = f"{key[0]}@{key[1]}"
             was = recorded.get(name)
             if was is None:
-                drifts.append((backend, name, None, "new shape, not in baseline"))
+                # A shape the baseline has never seen cannot be checked, but
+                # its absence is a real change to the corpus, so it gates.
+                drifts.append((backend, name, None,
+                               "new shape, not in baseline", True))
                 continue
+            gated = bool(was.get("gated"))
+            n_gated += gated
             now = rows[key]["rel"]
             old = was["rel"]
             if old <= 0:
@@ -294,8 +349,8 @@ def check_baseline(results, baseline):
             factor = now / old
             if factor > TOLERANCE or factor < 1.0 / TOLERANCE:
                 drifts.append((backend, name, factor,
-                               f"rel {old:.2f} -> {now:.2f}"))
-    return drifts
+                               f"rel {fmt_rel(old)} -> {fmt_rel(now)}", gated))
+    return drifts, n_gated
 
 
 # ----------------------------------------------------------------- report --
@@ -337,7 +392,11 @@ def report(results, calibrations):
 
 def fmt_rel(x):
     # Sub-0.01 shapes are the cheap ones, and rounding them all to "0.00"
-    # throws away the only thing that distinguishes them.
+    # throws away the only thing that distinguishes them. Since the
+    # calibration moved to n=10000 every ratio is ten times smaller, so the
+    # cheap end needs a fourth place to stay legible.
+    if x < 0.001:
+        return f"{x:.4f}"
     return f"{x:.3f}" if x < 0.01 else f"{x:.2f}"
 
 
@@ -354,6 +413,7 @@ def to_baseline(results):
         "schema": SCHEMA,
         "calibration": {"shape": CALIBRATION[0], "n": CALIBRATION[1]},
         "tolerance": TOLERANCE,
+        "gate_min_steady_us": GATE_MIN_STEADY_US,
         "note": ("Ratios, not milliseconds — see the header of run_perf.py. "
                  "`rel` is steady/steady(calibration) within the same backend "
                  "and run; `fs` is first/steady. Both are machine-independent, "
@@ -361,9 +421,10 @@ def to_baseline(results):
         "backends": {
             b: {
                 f"{k[0]}@{k[1]}": {
-                    "rel": round(v["rel"], 4),
+                    "rel": round(v["rel"], 6),
                     "fs": None if v["fs"] is None else round(v["fs"], 2),
                     "checksum": v["checksum"],
+                    "gated": v["gated"],
                 }
                 for k, v in sorted(rows.items())
             }
@@ -434,16 +495,20 @@ def main():
             print(f"baseline: schema {baseline.get('schema')} != {SCHEMA}, "
                   "skipping drift check")
         else:
-            drifts = check_baseline(results, baseline)
+            drifts, n_gated = check_baseline(results, baseline)
+            hard = [d for d in drifts if d[4]]
             if drifts:
-                print(f"DRIFT (tolerance {TOLERANCE}x)")
-                for backend, name, factor, why in drifts:
+                print(f"DRIFT (tolerance {TOLERANCE}x, {n_gated} gated rows)")
+                for backend, name, factor, why, gated in drifts:
                     f = "" if factor is None else f"  [{factor:.2f}x]"
-                    print(f"  {backend}  {name or ''}: {why}{f}")
-                if args.gate_drift:
+                    tail = ("" if gated
+                            else "  (report only — see GATE_MIN_STEADY_US)")
+                    print(f"  {backend}  {name or ''}: {why}{f}{tail}")
+                if hard and args.gate_drift:
                     failures += 1
             else:
-                print(f"baseline: no shape moved more than {TOLERANCE}x")
+                print(f"baseline: no shape moved more than {TOLERANCE}x "
+                      f"({n_gated} gated rows)")
     else:
         print("baseline: none recorded — run with --update-baseline")
 

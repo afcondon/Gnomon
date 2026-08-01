@@ -50,11 +50,18 @@ if [[ "$ONLY" == "both" || "$ONLY" == "oracle" ]]; then
   echo "==> performance canary (perf)"
   # Gates on CHECKSUMS — the shapes must compute the same answers on both
   # backends, and a benchmark that is quietly wrong is how a perf suite stays
-  # green while what it measures rots. Timing drift is REPORTED, not gated:
-  # this lane has no variance history yet and a canary that cries wolf on a
-  # busy CI runner gets muted, which is worse than one that is slightly deaf.
-  # Add --gate-drift once the tolerance is tightened against observed noise.
-  ( cd perf && python3 run_perf.py )
+  # green while what it measures rots.
+  #
+  # Timing drift now gates too (--gate-drift), which it did not when the lane
+  # was built. What changed is not the tolerance, which is still 2.0x, but the
+  # POPULATION it applies to. Six back-to-back runs of all three backends on an
+  # idle machine (2026-08-01) put the worst run-to-run spread over ALL measured
+  # rows at 5.74x — a 2.0x gate over that would have fired on noise nearly every
+  # run. Restricted to rows the runner marks as gated — largest n of each shape,
+  # and only above an absolute floor where the timing carries information — the
+  # worst spread was 1.69x and the median 1.10x. See CALIBRATION,
+  # GATE_MIN_STEADY_US and TOLERANCE in run_perf.py.
+  ( cd perf && python3 run_perf.py --gate-drift )
 fi
 
 echo "==> conformance lane GREEN"

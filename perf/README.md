@@ -55,7 +55,7 @@ growing with n* is the type-nesting signal itself.
 **The baseline stores ratios, not milliseconds.** An absolute baseline is
 worthless the moment it leaves the machine that recorded it. Each shape is
 normalised, within its own backend and its own run, against `loop-fore` at
-n=1000:
+n=10000:
 
 | column | meaning |
 |---|---|
@@ -74,11 +74,68 @@ backends **before it looks at a single timing**. A benchmark that computes
 the wrong answer quickly is the classic way for a performance suite to stay
 green while the thing it measures rots.
 
-Drift against the baseline is reported but does not fail the lane yet
-(`--gate-drift` turns it into a failure). The tolerance is a loose 2× because
-this lane has no variance history: a canary that cries wolf gets muted, which
-is strictly worse than one that is slightly deaf. Tighten it once a few weeks
-of runs say what the real noise is.
+## Drift gates too, but only on rows that can carry a gate
+
+Timing drift is a failure as well (`--gate-drift`, on in `bin/conformance.sh`).
+It was not, when the lane was first built, and what changed is worth stating
+precisely, because it is not what it looks like.
+
+**The tolerance did not change.** It is still 2×. What changed is the
+population it applies to, and the size of the thing everything is divided by.
+
+The original calibration was `loop-fore` at n=1000, which at five reps is six
+thousand iterations — not enough work for a tiering JIT to finish tiering.
+The JS reference measured that shape at 114, 135, 167, 188 and 196 µs on the
+same idle machine on the same day. Every `rel` in the table is divided by that
+number, so the lane's noise floor was being set by its own denominator. The
+tell was visible in the baseline and went unread: `loop-fore@10000` recorded
+`rel` 10.4 on Jurist — linear in n, as a host loop should be — but 6.3 on JS,
+not because the JS loop is sublinear but because its denominator was slow.
+At n=10000 the calibration reads 1020/1027/1023 µs across runs.
+
+That fixed the denominator but not the tail. Six back-to-back runs of all
+three backends (2026-08-01, idle M4 MBP) put the worst run-to-run spread at:
+
+| population | rows | median | 90th | worst |
+|---|---|---|---|---|
+| every measured row | 258 | 1.13× | 1.35× | **5.74×** |
+| largest n of each shape | 78 | 1.10× | 1.26× | 1.69× |
+| steady ≥ 50 µs | 123 | 1.10× | 1.27× | 5.74× |
+| **both — the gated population** | 56 | 1.10× | 1.21× | **1.69×** |
+
+A 2× gate over the first row would have fired on noise nearly every run. Over
+the last it has 1.18× of headroom over the worst thing noise managed in six
+tries. So the runner marks a row **gated** when it is both:
+
+1. **the largest n of that shape** — the smaller sizes exist to show the
+   *curve*, superlinearity and `f/s` growth, which is a diagnostic and not a
+   threshold; and
+2. **above `GATE_MIN_STEADY_US`** (50 µs) — below that, scheduler noise and
+   timer resolution dominate. `ffi-array@1600` on the JS reference is ~20 µs
+   and swings 1.5× between runs while doing identical work.
+
+Ungated rows are still measured, still printed, and still reported as drift —
+they just carry `(report only)` and cannot fail a build. Nothing is hidden.
+
+The gate flag is decided when the baseline is **recorded**, and travels in it.
+Recomputing it per run would make a shape near the 50 µs line gate on one run
+and not the next. It is therefore a property of the recording machine: on a
+slower box this excludes rows that would have been measurable there, which
+costs a little coverage and never invents an alarm.
+
+Two consequences worth knowing:
+
+- `fold-array` is never gated on any backend, by design. It is `fold-list`'s
+  control rather than a subject, and array traversal is gated through
+  `map-array` instead.
+- `ffi-array` and `string-join` run to n=12800 for no reason other than this.
+  At 1600 both sat under the floor on every backend, so neither was gated
+  anywhere — and `ffi-array` is one of the two shapes that measure the FFI
+  axis this corpus was built around. **A shape that cannot fail the gate is
+  not protected by it.**
+
+Tighten toward the 90th percentile once a few weeks of CI runs say what the
+tail really looks like; six samples underestimate it.
 
 A shape that does not complete is recorded as **DNF** rather than crashing
 the lane — see below for why that is a normal outcome here.
