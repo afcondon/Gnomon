@@ -1,0 +1,21 @@
+# The performance canary's workspace. Same arrangement as test-suite/: no
+# `backend:` section, so this builds the normal JS output, and the runner
+# passes --codegen corefn,js so the same build also feeds purejl. Both
+# backends then run the same shapes with the same harness.
+package:
+  name: gnomon-perf
+  dependencies:
+    - arrays
+    - console
+    - effect
+    - foldable-traversable
+    - lists
+    - maybe
+    - prelude
+    - refs
+    - st
+    - strings
+    - tailrec
+workspace:
+  packageSet:
+    registry: 57.1.0

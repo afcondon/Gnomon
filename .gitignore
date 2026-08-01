@@ -13,6 +13,11 @@ output-go/
 test-suite/output/
 test-suite/.spago/
 
+# perf (the performance canary) — same shape as test-suite
+perf/output/
+perf/output-go/
+perf/.spago/
+
 # node
 node_modules/
 
