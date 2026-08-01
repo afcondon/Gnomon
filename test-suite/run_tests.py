@@ -98,21 +98,21 @@ KNOWN_DIVERGENCES = {
     # every backend chooses, and all three copied JS's while running
     # wider arithmetic underneath -- which is the whole of the
     # incoherence, and Gate C9's to settle.
-    ("Test.Boundaries", "int-top-plus-1"),
-    ("Test.Boundaries", "int-bottom-minus-1"),
-    ("Test.Boundaries", "int-negate-bottom"),
-    ("Test.Boundaries", "int-abs-bottom"),
-    ("Test.Boundaries", "int-negate-bottom-gt-top"),
-    ("Test.Boundaries", "int-top-times-2"),
-    ("Test.Boundaries", "int-bottom-times-2"),
-    ("Test.Boundaries", "int-top-plus-top"),
-    ("Test.Boundaries", "int-top-times-top"),
-    ("Test.Boundaries", "int-quot-bottom-by-neg1"),
-    ("Test.Boundaries", "int-lcm-top-top"),
+    ("Test.Boundaries", "INT64-int-top-plus-1"),
+    ("Test.Boundaries", "INT64-int-bottom-minus-1"),
+    ("Test.Boundaries", "INT64-int-negate-bottom"),
+    ("Test.Boundaries", "INT64-int-abs-bottom"),
+    ("Test.Boundaries", "INT64-int-negate-bottom-gt-top"),
+    ("Test.Boundaries", "INT64-int-top-times-2"),
+    ("Test.Boundaries", "INT64-int-bottom-times-2"),
+    ("Test.Boundaries", "INT64-int-top-plus-top"),
+    ("Test.Boundaries", "INT64-int-top-times-top"),
+    ("Test.Boundaries", "INT64-int-quot-bottom-by-neg1"),
+    ("Test.Boundaries", "INT64-int-lcm-top-top"),
     # REM0: `Int.rem x 0` is NaN on JS -- a value that is not an Int at
     # all. No backend with a real integer type can reproduce it; all
     # three answer 0.
-    ("Test.Boundaries", "int-rem-zero"),
+    ("Test.Boundaries", "INT64-int-rem-zero"),
     # NEGZERO: `purs`'s JS backend INLINES `Data.Ring.negate` to unary
     # minus, so `-0.0` there is a genuine negative zero. `negate` is not
     # a class member -- it is `negate a = zero - a` in the Prelude -- so
@@ -124,7 +124,7 @@ KNOWN_DIVERGENCES = {
     ("Test.Boundaries", "num-sign-of-negzero"),
     ("Test.Boundaries", "num-sign-of-negzero-plus-negzero"),
     ("Test.Boundaries", "num-sign-of-sqrt-negzero"),
-    ("Test.Boundaries", "num-min-zeros"),
+    ("Test.Boundaries", "NEGZERO-num-min-zeros"),
     ("Test.Boundaries", "num-pow-negzero-neg1"),
     ("Test.Boundaries", "num-atan2-zero-negzero"),
     # ASTRAL: JS counts UTF-16 code units; these backends count
@@ -135,14 +135,14 @@ KNOWN_DIVERGENCES = {
     # SURROGATE: a Go string is UTF-8 and cannot hold a lone
     # surrogate, so one round-trips as U+FFFD. Structural, not a
     # shim choice.
-    ("Test.Boundaries", "char-fromCharCode-high-surrogate"),
-    ("Test.Boundaries", "char-fromCharCode-low-surrogate"),
+    ("Test.Boundaries", "ASTRAL-char-fromCharCode-high-surrogate"),
+    ("Test.Boundaries", "ASTRAL-char-fromCharCode-low-surrogate"),
     # NEGZERO, in a real library: `perturbGen` folds float32ToInt32's bit
     # pattern into QuickCheck's seed, and the sign bit of -0.0 is part of that
     # pattern. So the sign of a zero changes WHICH TEST CASES QuickCheck
     # generates. Same single cause as the Test.Boundaries NEGZERO block (#48);
     # this is what it costs downstream.
-    ("Test.NullableRandom", "perturb-neg-zero"),
+    ("Test.NullableRandom", "NEGZERO-perturb-neg-zero"),
 }
 
 # Modules that cannot run yet because a foreign this backend does not supply

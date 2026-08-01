@@ -84,7 +84,7 @@ probe n =
 bits :: Effect Unit
 bits = do
   t "perturb-zero" (probe 0.0)
-  t "perturb-neg-zero" (probe (-0.0))
+  t "NEGZERO-perturb-neg-zero" (probe (-0.0))
   t "perturb-one" (probe 1.0)
   t "perturb-neg-one" (probe (-1.0))
   t "perturb-two" (probe 2.0)

@@ -75,18 +75,18 @@ intLimits :: Effect Unit
 intLimits = do
   t "int-top" (show (top :: Int))
   t "int-bottom" (show (bottom :: Int))
-  t "int-top-plus-1" (show (top + 1 :: Int))
-  t "int-bottom-minus-1" (show (bottom - 1 :: Int))
-  t "int-negate-bottom" (show (negate (bottom :: Int)))
+  t "INT64-int-top-plus-1" (show (top + 1 :: Int))
+  t "INT64-int-bottom-minus-1" (show (bottom - 1 :: Int))
+  t "INT64-int-negate-bottom" (show (negate (bottom :: Int)))
   t "int-negate-top" (show (negate (top :: Int)))
-  t "int-abs-bottom"
+  t "INT64-int-abs-bottom"
     (show (if (bottom :: Int) < 0 then negate bottom else bottom :: Int))
   -- The `Bounded Int` law, stated as an assertion rather than assumed.
-  t "int-negate-bottom-gt-top" (show (negate (bottom :: Int) > top))
-  t "int-top-times-2" (show (top * 2 :: Int))
-  t "int-bottom-times-2" (show (bottom * 2 :: Int))
-  t "int-top-plus-top" (show (top + top :: Int))
-  t "int-top-times-top" (show (top * top :: Int))
+  t "INT64-int-negate-bottom-gt-top" (show (negate (bottom :: Int) > top))
+  t "INT64-int-top-times-2" (show (top * 2 :: Int))
+  t "INT64-int-bottom-times-2" (show (bottom * 2 :: Int))
+  t "INT64-int-top-plus-top" (show (top + top :: Int))
+  t "INT64-int-top-times-top" (show (top * top :: Int))
 
 --------------------------------------------------------------------------
 -- Int — division at the edges
@@ -100,7 +100,7 @@ intLimits = do
 intDivision :: Effect Unit
 intDivision = do
   t "int-div-bottom-by-neg1" (show ((bottom :: Int) / (-1)))
-  t "int-quot-bottom-by-neg1" (show (Int.quot (bottom :: Int) (-1)))
+  t "INT64-int-quot-bottom-by-neg1" (show (Int.quot (bottom :: Int) (-1)))
   t "int-rem-bottom-by-neg1" (show (Int.rem (bottom :: Int) (-1)))
   t "int-mod-bottom-by-neg1" (show ((bottom :: Int) `mod` (-1)))
   t "int-div-top-by-neg1" (show ((top :: Int) / (-1)))
@@ -108,7 +108,7 @@ intDivision = do
   t "int-div-zero" (show (1 / 0 :: Int))
   t "int-mod-zero" (show (1 `mod` 0 :: Int))
   t "int-quot-zero" (show (Int.quot 1 0))
-  t "int-rem-zero" (show (Int.rem 1 0))
+  t "INT64-int-rem-zero" (show (Int.rem 1 0))
   t "int-zero-div-zero" (show (0 / 0 :: Int))
   -- `degree` is the other place a sentinel hides: our own EuclideanRing shim
   -- clamps it at 2147483647, which is exactly `top`.
@@ -117,7 +117,7 @@ intDivision = do
   t "int-degree-zero" (show (degree (0 :: Int)))
   t "int-gcd-bottom-bottom" (show (gcd (bottom :: Int) bottom))
   t "int-gcd-bottom-zero" (show (gcd (bottom :: Int) 0))
-  t "int-lcm-top-top" (show (lcm (top :: Int) top))
+  t "INT64-int-lcm-top-top" (show (lcm (top :: Int) top))
   t "int-lcm-zero" (show (lcm (5 :: Int) 0))
 
 --------------------------------------------------------------------------
@@ -260,7 +260,7 @@ numberZero = do
   t "num-sign-of-negzero-plus-zero" (signOfZero ((-0.0) + 0.0))
   t "num-sign-of-sqrt-negzero" (signOfZero (Num.sqrt (-0.0)))
   t "num-show-negzero" (show (-0.0))
-  t "num-min-zeros" (signOfZero (Num.min 0.0 (-0.0)))
+  t "NEGZERO-num-min-zeros" (signOfZero (Num.min 0.0 (-0.0)))
   t "num-max-zeros" (signOfZero (Num.max 0.0 (-0.0)))
 
 --------------------------------------------------------------------------
@@ -452,8 +452,8 @@ charLimits = do
   t "char-fromCharCode-over" (show (map Char.toCharCode (Char.fromCharCode 65536)))
   t "char-fromCharCode-neg" (show (map Char.toCharCode (Char.fromCharCode (-1))))
   -- Lone surrogates: representable as Char, not valid on their own as text.
-  t "char-fromCharCode-high-surrogate" (show (map Char.toCharCode (Char.fromCharCode 55296)))
-  t "char-fromCharCode-low-surrogate" (show (map Char.toCharCode (Char.fromCharCode 57343)))
+  t "ASTRAL-char-fromCharCode-high-surrogate" (show (map Char.toCharCode (Char.fromCharCode 55296)))
+  t "ASTRAL-char-fromCharCode-low-surrogate" (show (map Char.toCharCode (Char.fromCharCode 57343)))
   t "char-enum-top" (show (fromEnum (top :: Char)))
   t "char-enum-bottom" (show (fromEnum (bottom :: Char)))
   t "char-toEnum-over" (show (map Char.toCharCode (toEnum 65536 :: Maybe Char)))
