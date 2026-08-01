@@ -137,6 +137,12 @@ KNOWN_DIVERGENCES = {
     # shim choice.
     ("Test.Boundaries", "char-fromCharCode-high-surrogate"),
     ("Test.Boundaries", "char-fromCharCode-low-surrogate"),
+    # NEGZERO, in a real library: `perturbGen` folds float32ToInt32's bit
+    # pattern into QuickCheck's seed, and the sign bit of -0.0 is part of that
+    # pattern. So the sign of a zero changes WHICH TEST CASES QuickCheck
+    # generates. Same single cause as the Test.Boundaries NEGZERO block (#48);
+    # this is what it costs downstream.
+    ("Test.NullableRandom", "perturb-neg-zero"),
 }
 
 # Modules that cannot run yet because a foreign this backend does not supply

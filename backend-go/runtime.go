@@ -13,6 +13,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"regexp"
 	"strconv"
@@ -2628,4 +2629,35 @@ func _jsExponent(s string) string {
 		exp = "0"
 	}
 	return mantissa + "e" + sign + exp
+}
+
+// ---------------------------------------------------------------------------
+// Effect.Random / Data.Nullable / Test.QuickCheck.Gen  (safe-subset work)
+// ---------------------------------------------------------------------------
+
+// `random :: Effect Number` is a VALUE of effect type, so it is a
+// zero-argument closure, not a function of one argument.
+var Effect_Random_random any = func() any { return rand.Float64() }
+
+// JS null maps to nil. Unit is also nil, which is harmless: the two never meet
+// in a well-typed program, and the JS backend has exactly the same overlap
+// between null and undefined-as-unit.
+var Data_Nullable_null any = nil
+
+// `nullable` is Fn3, so it arrives uncurried through runFn3.
+var Data_Nullable_nullable any = func(args ...any) any {
+	if args[0] == nil {
+		return args[1]
+	}
+	return args[2].(func(any) any)(args[0])
+}
+
+var Data_Nullable_notNull any = func(x any) any { return x }
+
+// Reinterpret the low 32 bits of a float32 as a signed int32 -- the JS original
+// round-trips through an ArrayBuffer to do exactly this. It is a bit pattern,
+// not a numeric conversion: the value is meaningless and the BITS are the
+// point, because QuickCheck uses it to derive a seed.
+var Test_QuickCheck_Gen_float32ToInt32 any = func(n any) any {
+	return int(int32(math.Float32bits(float32(n.(float64)))))
 }
