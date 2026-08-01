@@ -344,6 +344,94 @@ var Record_Unsafe_unsafeSet any = func(label any) any {
 	}
 }
 
+var Record_Unsafe_unsafeHas any = func(label any) any {
+	return func(rec any) any {
+		_, ok := rec.(map[string]any)[label.(string)]
+		return ok
+	}
+}
+
+var Record_Unsafe_unsafeDelete any = func(label any) any {
+	return func(rec any) any {
+		out := map[string]any{}
+		for k, v := range rec.(map[string]any) {
+			if k != label.(string) {
+				out[k] = v
+			}
+		}
+		return out
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Record.Builder  (record-4.0.0)
+//
+// The Builder foreigns MUTATE, deliberately: `Record.Builder` copies once via
+// copyRecord and every subsequent step edits that copy in place, which is what
+// makes a chain of builders one allocation rather than N. A Go map is a
+// reference type, so the JS translates directly -- but only because the copy
+// really does happen first. Reading these as pure functions and copying in each
+// one would be correct and would throw away the whole point of the module.
+// ---------------------------------------------------------------------------
+
+var Record_Builder_copyRecord any = func(rec any) any {
+	out := map[string]any{}
+	for k, v := range rec.(map[string]any) {
+		out[k] = v
+	}
+	return out
+}
+
+var Record_Builder_unsafeInsert any = func(l any) any {
+	return func(a any) any {
+		return func(rec any) any {
+			rec.(map[string]any)[l.(string)] = a
+			return rec
+		}
+	}
+}
+
+var Record_Builder_unsafeModify any = func(l any) any {
+	return func(f any) any {
+		return func(rec any) any {
+			m := rec.(map[string]any)
+			m[l.(string)] = f.(func(any) any)(m[l.(string)])
+			return rec
+		}
+	}
+}
+
+var Record_Builder_unsafeDelete any = func(l any) any {
+	return func(rec any) any {
+		delete(rec.(map[string]any), l.(string))
+		return rec
+	}
+}
+
+var Record_Builder_unsafeRename any = func(l1 any) any {
+	return func(l2 any) any {
+		return func(rec any) any {
+			m := rec.(map[string]any)
+			m[l2.(string)] = m[l1.(string)]
+			delete(m, l1.(string))
+			return rec
+		}
+	}
+}
+
+// Record.Unsafe.Union -- unsafeUnionFn is uncurried (runFn2); the LEFT record
+// wins on key collisions, which is why r2 is copied first and r1 second.
+var Record_Unsafe_Union_unsafeUnionFn any = func(args ...any) any {
+	out := map[string]any{}
+	for k, v := range args[1].(map[string]any) {
+		out[k] = v
+	}
+	for k, v := range args[0].(map[string]any) {
+		out[k] = v
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Data.Semiring / Data.Ring / Data.EuclideanRing  (INT64 ledger: no int32 wrap)
 // ---------------------------------------------------------------------------
