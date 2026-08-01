@@ -44,8 +44,11 @@ import Control.Alternative (guard)
 import Data.Array as Array
 import Data.Array.NonEmpty (NonEmptyArray)
 import Data.Array.NonEmpty as NEA
+import Data.Char (toCharCode)
 import Data.Foldable (foldMap)
+import Data.Int as Int
 import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Monoid (power)
 import Data.Newtype (unwrap)
 import Data.Number as Number
 import Data.Set (Set)
@@ -730,7 +733,25 @@ goStr s = "\"" <> foldMap escapeChar (SCU.toCharArray s) <> "\""
     '\n' -> "\\n"
     '\t' -> "\\t"
     '\r' -> "\\r"
+    -- Every OTHER control character has to be escaped too, not passed
+    -- through. Go rejects a raw NUL in a source file outright ("invalid NUL
+    -- character") and the rest are at best invisible in the output. Passing
+    -- them through was safe only for as long as nothing wrote one:
+    -- Test.Boundaries asks for '\x0' and this emitter put a literal NUL into
+    -- the generated file, which then failed to compile.
+    --
+    -- psgo's replaceBasicEscape already does this (Language.PureScript.Go.
+    -- CodeGen.Common). The two emitters are separate code and only this
+    -- corpus keeps them honest with each other, so the rule has to be stated
+    -- twice — which is exactly why it was missing here.
+    _ | toCharCode c < 0x20 || toCharCode c == 0x7f ->
+          "\\u" <> padHex4 (toCharCode c)
     _ -> SCU.singleton c
+
+  padHex4 :: Int -> String
+  padHex4 n =
+    let h = Int.toStringAs Int.hexadecimal n
+    in power "0" (4 - String.length h) <> h
 
 commaSep :: Array String -> String
 commaSep = String.joinWith ", "
