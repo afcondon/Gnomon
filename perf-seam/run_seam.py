@@ -263,9 +263,17 @@ def main():
 
         # The payload axis, priced per element. This is the axis that
         # separates the runtimes: the work axis says roughly the same thing
-        # everywhere, but marshalling an Array Number does not, because
+        # everywhere, but READING an Array Number does not, because
         # `Array Number` is a native contiguous vector on one runtime and a
         # list of boxed objects on another.
+        #
+        # CORRECTED 2026-08-02: first reported as marshalling — the cost of
+        # MOVING the array — and that was wrong. `Seam.ArrayCost` in the
+        # Pythia lane runs the identical foreign call twice, once taking only
+        # `Array.length` and once folding every element, and gets 4,402 us
+        # against 6,090 us over 16,384 Numbers. The crossing is free; the fold
+        # is the bill. Magnitude right, attribution wrong, and the design rule
+        # that follows is a different rule.
         pay = [r for r in results if r["axis"] == "payload"]
         if len(pay) >= 2:
             # x is Numbers crossed per call: the foreign returns 2 per sample.
@@ -277,11 +285,13 @@ def main():
             sxc = sum(x * y for x, y in zip(xs2, cs2))
             den2 = m * sxx - sx * sx
             per_elem_ns = 1000.0 * (m * sxc - sx * sc2) / den2 if den2 else 0.0
-            print(f"  Marshalling, fitted over the payload axis:"
-                  f"  {per_elem_ns:.0f} ns per Number crossed")
-            print(f"  At that rate a 1,000-element return costs"
-                  f" {per_elem_ns:.0f} us per call, so a seam that hands back")
-            print("  a whole result set pays for it in a way a scalar seam never sees.")
+            print(f"  Reading the payload, fitted over that axis:"
+                  f"  {per_elem_ns:.0f} ns per Number FOLDED")
+            print(f"  At that rate folding a 1,000-element return costs"
+                  f" {per_elem_ns:.0f} us per call. This is the fold, not the")
+            print("  transport: passing a foreign array onward costs almost nothing.")
+            print("  So the rule is DON'T ITERATE A BIG FOREIGN ARRAY, which is a")
+            print("  weaker constraint than 'don't return one'.")
             print()
         d = max(r["distortion"] for r in results)
         verdict = "clean" if d < 1.1 else "DEFORMED — the seam changed how the library is called"

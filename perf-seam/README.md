@@ -94,6 +94,39 @@ The point is that the ordering is **structural, not incidental**: it follows
 from how each backend represents `Array Number`, and it would not change with
 a faster machine or a different library.
 
+## Why this lane has no foreign-origin gate, and the other two do
+
+The Jurist and Pythia lanes each run `Seam/ForeignOrigin.purs` before any
+timing. It exists because the differential corpus can only test values
+**PureScript itself constructed** — it deliberately contains no foreign
+libraries — so values that *enter* from the foreign side are an untested
+population, and a real bug lived there: purepy's `show` printed
+`np.float64(3997569)` for 399.7569, silently, for anything that came back from
+numpy. Jurist had the same hazard for `Float32`, `Rational` and `BigFloat`.
+
+**Gnomon cannot have it,** and the reason is the same property that makes it
+expensive on the payload axis. psgo represents `Number` as a `float64` boxed in
+`any`, and unwraps it with a type assertion:
+
+```go
+var Data_Show_showNumberImpl any = func(n any) any { return _showNumber(n.(float64)) }
+```
+
+So a `float32` arriving where `Number` was promised does not render
+approximately, it stops:
+
+```
+float64   ok     0.1
+float32   PANIC  interface conversion: interface {} is float32, not float64
+int64     PANIC  interface conversion: interface {} is int64, not float64
+```
+
+A gate here would assert something the runtime already enforces. Recording that
+is the point: **the hazard class is shared by the dynamically-typed backends
+and absent from the statically-typed one**, and the `any` box that costs ~25 ns
+per `Number` read is exactly what buys the check. The two axes are the same
+design decision seen from opposite sides.
+
 ## The verdict
 
 **Practical, and the cheapest seam of the three.** A crossing is ~1.7 µs, so a
