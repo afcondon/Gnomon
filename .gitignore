@@ -27,3 +27,8 @@ node_modules/
 
 # Python bytecode (perf/run_perf.py)
 __pycache__/
+
+# The seam-tax lane's build products
+perf-seam/output/
+perf-seam/output-go/
+perf-seam/.spago/

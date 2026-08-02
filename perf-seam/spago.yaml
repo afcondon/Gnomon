@@ -1,0 +1,28 @@
+# The seam-tax lane.
+#
+# UNLIKE perf/ and test-suite/, this one sets `backend: cmd: "true"` — CoreFn
+# is emitted, JS codegen is skipped, and purejl runs over output/ afterwards.
+# That is not a shortcut, it is forced: the seam under test calls
+# compress/gzip, whose Go implementation has no JavaScript counterpart, so there is no honest
+# `.js` to put beside Kernel.purs. A stub that threw at run time would be a
+# fake companion for a genuinely single-runtime module.
+#
+# This is also why the lane cannot be cross-checked against the JS reference
+# the way the canary and the differential corpus are: what it measures is
+# backend-specific by construction. The comparison is against native Julia
+# instead, in native/seam_native.go.
+package:
+  name: gnomon-perf-seam
+  dependencies:
+    - arrays
+    - console
+    - effect
+    - integers
+    - maybe
+    - prelude
+    - refs
+workspace:
+  packageSet:
+    registry: 57.1.0
+  backend:
+    cmd: "true"
