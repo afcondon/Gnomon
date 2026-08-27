@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# backend-go — transpile a PureScript program's CoreFn to Go.
+#
+# RUN THIS FROM THE PROGRAM'S OWN DIRECTORY, not from the backend's. That is
+# not a convenience: a program's own FFI is found CO-LOCATED with its `.purs`
+# via the relative `modulePath` CoreFn records, and `modulePath` is relative to
+# wherever `spago build` ran. Invoked from anywhere else, every co-located
+# foreign silently fails to resolve and the Go build dies on `undefined:`.
+#
+#   cd ~/my-program && spago build
+#   backend-go --corefn-dir output --output-dir /tmp/out --main Main
+#
+# Because the caller's CWD is now the program, `--foreign-dir` cannot default
+# to `./foreign` — that would look for the BACKEND's package-FFI layer inside
+# the program. This wrapper points it at the backend's own `foreign/`, which is
+# whose layer it is. Pass `--foreign-dir` explicitly to override.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND="$(cd "$HERE/.." && pwd)"
+ENTRY="$BACKEND/output/Main/index.js"
+
+if [ ! -f "$ENTRY" ]; then
+  echo "backend-go: not built — run 'spago build' in $BACKEND" >&2
+  exit 1
+fi
+
+# Only supply the default when the caller has not chosen one.
+args=("$@")
+case " $* " in
+  *" --foreign-dir "*) ;;
+  *) args+=(--foreign-dir "$BACKEND/foreign") ;;
+esac
+
+exec node "$HERE/backend-go.mjs" "${args[@]}"
