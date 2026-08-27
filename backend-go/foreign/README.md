@@ -6,6 +6,30 @@
 to re-derive.** If your program fails to link with `undefined:
 Some_Module_someName`, the fix belongs here, not in a shim beside your app.
 
+## What belongs here, and what does NOT
+
+This directory is for the FFI of **packages your program depends on**. The FFI
+of the modules **your program wrote** does not belong here: it goes in a `.go`
+file **co-located with the `.purs`**, basename with the extension swapped, the
+way `purs` has always located `.js`.
+
+```
+core/src/Runtime.purs
+core/src/Runtime.js     ← node's implementation of the seam
+core/src/Runtime.go     ← Go's, found via CoreFn modulePath
+```
+
+Three peers, none of them "the copy" — which is the point, and is why an
+application should never keep its own Go in a flat directory of its own
+devising. That convention is `polyglot-template`'s
+(`docs/specs/co-located-user-foreigns.md`, lineage: Kevin Jameson,
+*Multi-Platform Code Management*, O'Reilly 1994), and it is implemented in
+`Main.purs` as `copyColocatedForeigns` — the complement of this layer's
+`copyPackageForeigns`, not an alternative to it.
+
+Rule of thumb: **if you would have to fork the package to fix it, it goes here;
+if you can just edit the file next door, it goes next door.**
+
 ## Why this directory exists, and what it is not
 
 `runtime.go` is the **core** foreign layer: prelude, `Data.Array`,

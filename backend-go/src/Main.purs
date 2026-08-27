@@ -7,7 +7,7 @@ import ArgParse.Basic as ArgParser
 import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Set as Set
 import Data.String as String
 import Data.Traversable (for_)
@@ -25,7 +25,7 @@ import Node.Path as Path
 import Node.Process as Process
 import PureScript.Backend.Optimizer.Codegen.Go (codegenModule)
 import PureScript.Backend.Optimizer.Codegen.Go.Builder (basicBuildMain)
-import PureScript.Backend.Optimizer.CoreFn (Ident(..), ModuleName(..), Qualified(..))
+import PureScript.Backend.Optimizer.CoreFn (Ident(..), Module(..), ModuleName(..), Qualified(..))
 import PureScript.Backend.Optimizer.Reachability (pruneModule, reachableFromEntry)
 import PureScript.Backend.Optimizer.Semantics.Foreign (coreForeignSemantics)
 
@@ -71,6 +71,10 @@ build args = do
   -- from `main` and emit only the reachable bindings. Pruning needs the global
   -- reference graph, so we can't emit per-module as we go.
   modulesRef <- liftEffect (Ref.new [])
+  -- Where each module's source sits, kept because `onCodegenModule` is the only
+  -- place the CoreFn module (and so `modulePath`) is in scope; the BackendModule
+  -- that survives into `onCodegenAfter` has no idea where it came from.
+  sourcesRef <- liftEffect (Ref.new [])
   basicBuildMain
     { resolveCoreFnDirectory: pure args.coreFnDir
     , resolveExternalDirectives: pure Map.empty
@@ -78,8 +82,18 @@ build args = do
     , foreignSemantics: coreForeignSemantics
     , onCodegenBefore: mkdirp args.outputDir
     , onPrepareModule: \_ coreFnMod -> pure coreFnMod
-    , onCodegenModule: \_ _ backendMod _ ->
-        liftEffect (Ref.modify_ (_ <> [ backendMod ]) modulesRef)
+    , onCodegenModule: \_ coreFnMod backendMod _ -> liftEffect do
+        case coreFnMod of
+          Module m -> Ref.modify_
+            ( _ <>
+                [ { name: case m.name of ModuleName n -> n
+                  , path: m.path
+                  , hasForeign: not (Array.null m.foreign)
+                  }
+                ]
+            )
+            sourcesRef
+        Ref.modify_ (_ <> [ backendMod ]) modulesRef
     , onCodegenAfter: do
         modules <- liftEffect (Ref.read modulesRef)
         let
@@ -96,6 +110,9 @@ build args = do
               FS.writeTextFile UTF8 (Path.concat [ args.outputDir, goIdent name <> ".go" ]) formatted
         copyPackageForeigns args.foreignDir args.outputDir
           (map (\m -> case m.name of ModuleName n -> n) modules)
+        -- Second, so that a module carrying both lands on its own file: the
+        -- nearer of the two wins. See copyColocatedForeigns.
+        copyColocatedForeigns args.outputDir =<< liftEffect (Ref.read sourcesRef)
         let
           entryGo = String.joinWith "\n"
             [ "package main"
@@ -143,6 +160,66 @@ copyPackageForeigns foreignDir outputDir names =
             (Path.concat [ outputDir, goIdent name <> "_foreign.go" ])
             body
           Console.log ("  + foreign " <> name)
+
+-- | Where a module's source sits, and whether it declares any FFI at all.
+type ForeignSource =
+  { name :: String
+  , path :: String
+  , hasForeign :: Boolean
+  }
+
+-- | The FFI a program supplies for its OWN modules, located the way `purs`
+-- | locates `.js`: a `.go` file CO-LOCATED with the `.purs`, basename with the
+-- | extension swapped, found via CoreFn `modulePath`. `Serve.purs` beside
+-- | `Serve.js` beside `Serve.go` — three peers, none of them "the copy".
+-- |
+-- | This is the harmonized convention of `polyglot-template`
+-- | (`docs/specs/co-located-user-foreigns.md`), which `purejl` and the Haskell
+-- | `psgo` already implement, and which is `purs`'s own rule for `.js` rather
+-- | than anything a backend invented.
+-- |
+-- | It is the COMPLEMENT of `copyPackageForeigns`, not an alternative:
+-- | `foreign/<Module.Name>.go` supplies the FFI of the packages a program
+-- | DEPENDS ON; this supplies the FFI of the modules it WROTE. Without it an
+-- | application has nowhere to put its own Go but a flat directory of its own
+-- | devising, which is how `purejl` ended up with `ffi-jl/` and how one
+-- | consumer ended up keeping the real runtime's FFI in a directory named for
+-- | the test harness.
+-- |
+-- | Destination naming is `<Module_Name>_foreign.go` — module-qualified, like
+-- | `copyPackageForeigns`, and deliberately NOT `psgo`'s basename-only form:
+-- | two modules may share a basename, and the qualified name cannot collide.
+-- | It also means a co-located file and a package one for the same module
+-- | resolve to the same path, so running this second lets co-location win,
+-- | which is right — it is the nearer of the two.
+-- |
+-- | THE BUILT SET, NOT THE REACHABLE SET, for the reason `copyPackageForeigns`
+-- | gives at length: a module can be pruned away entirely and still have its
+-- | symbols called from one that survived.
+-- |
+-- | A module declaring no `foreign import` is skipped without looking, and a
+-- | module whose `.go` is absent is passed over in silence — its foreigns come
+-- | from `foreign/` or the embedded prelude, which is the ordinary case and not
+-- | a gap worth warning about.
+copyColocatedForeigns :: FilePath -> Array ForeignSource -> Aff Unit
+copyColocatedForeigns outputDir sources =
+  for_ sources \src ->
+    when src.hasForeign do
+      let goPath = dropPursExtension src.path <> ".go"
+      attempt (FS.readTextFile UTF8 goPath) >>= case _ of
+        Left _ -> pure unit
+        Right body -> do
+          FS.writeTextFile UTF8
+            (Path.concat [ outputDir, goIdent src.name <> "_foreign.go" ])
+            body
+          Console.log ("  + foreign " <> src.name <> " (co-located " <> goPath <> ")")
+
+-- | `…/Serve.purs` -> `…/Serve`. Strips exactly the `.purs` suffix rather than
+-- | any final dot-segment: a module path is always a `.purs` file, and the
+-- | general form would mangle a directory such as `src/v1.2/Serve.purs`.
+dropPursExtension :: String -> String
+dropPursExtension path =
+  fromMaybe path (String.stripSuffix (String.Pattern ".purs") path)
 
 -- | A PureScript module name as a Go identifier prefix: dots become
 -- | underscores, which is the mangling the codegen and every hand-written
