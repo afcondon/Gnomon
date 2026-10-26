@@ -100,6 +100,7 @@ build args = do
           entry = Qualified (Just (ModuleName args.mainModule)) (Ident "main")
           reachable = reachableFromEntry entry modules
         -- emit only modules with a reachable binding, each pruned to its reachable set
+        emittedRef <- liftEffect (Ref.new Set.empty)
         for_ modules \backendMod ->
           case pruneModule reachable backendMod of
             Nothing -> pure unit
@@ -108,11 +109,15 @@ build args = do
                 ModuleName name = pruned.name
                 formatted = Dodo.print Dodo.plainText Dodo.twoSpaces (codegenModule { intTags: false } pruned)
               FS.writeTextFile UTF8 (Path.concat [ args.outputDir, goIdent name <> ".go" ]) formatted
+              liftEffect (Ref.modify_ (Set.insert name) emittedRef)
         copyPackageForeigns args.foreignDir args.outputDir
           (map (\m -> case m.name of ModuleName n -> n) modules)
         -- Second, so that a module carrying both lands on its own file: the
         -- nearer of the two wins. See copyColocatedForeigns.
-        copyColocatedForeigns args.outputDir =<< liftEffect (Ref.read sourcesRef)
+        emitted <- liftEffect (Ref.read emittedRef)
+        sources <- liftEffect (Ref.read sourcesRef)
+        copyColocatedForeigns args.outputDir
+          (Array.filter (\src -> Set.member src.name emitted) sources)
         let
           entryGo = String.joinWith "\n"
             [ "package main"
@@ -193,9 +198,22 @@ type ForeignSource =
 -- | resolve to the same path, so running this second lets co-location win,
 -- | which is right — it is the nearer of the two.
 -- |
--- | THE BUILT SET, NOT THE REACHABLE SET, for the reason `copyPackageForeigns`
--- | gives at length: a module can be pruned away entirely and still have its
--- | symbols called from one that survived.
+-- | THE EMITTED SET, and here the asymmetry with `copyPackageForeigns` is
+-- | deliberate. That one over-includes because it cannot tell: the optimizer
+-- | erases a library module like `Foreign.Object.ST` wholesale while a
+-- | surviving sibling still calls `Foreign_Object_ST_poke`, so keying on what
+-- | survived pruning would miss exactly the cases that fail to link.
+-- |
+-- | An application's own FFI is not in that position. If a program's module was
+-- | pruned out of THIS entry point, nothing in this binary calls its foreigns,
+-- | and linking them anyway drags the module's transitive Go imports into a
+-- | build that has no use for them — a test harness suddenly needing
+-- | `gopkg.in/yaml.v3` because some unrelated module of the same program parses
+-- | YAML. Over-inclusion is cheap when the cost is an unused `var`; it is not
+-- | when the cost is a dependency.
+-- |
+-- | The backstop if that judgement is ever wrong is a link error naming the
+-- | symbol, at build time, in every harness at once.
 -- |
 -- | A module declaring no `foreign import` is skipped without looking, and a
 -- | module whose `.go` is absent is passed over in silence — its foreigns come

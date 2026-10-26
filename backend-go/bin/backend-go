@@ -20,9 +20,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND="$(cd "$HERE/.." && pwd)"
 ENTRY="$BACKEND/output/Main/index.js"
 
-if [ ! -f "$ENTRY" ]; then
-  echo "backend-go: not built — run 'spago build' in $BACKEND" >&2
-  exit 1
+# Build on demand. `spago run` used to do this for callers; now that they
+# invoke from their own directory they cannot, and a silently stale backend
+# would mean a fix landing upstream never reaching the thing under test.
+if [ ! -f "$ENTRY" ] || [ -n "$(find "$BACKEND/src" -name '*.purs' -newer "$ENTRY" -print -quit 2>/dev/null)" ]; then
+  ( cd "$BACKEND" && spago build ) >&2 || { echo "backend-go: spago build failed in $BACKEND" >&2; exit 1; }
 fi
 
 # Only supply the default when the caller has not chosen one.
