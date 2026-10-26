@@ -2535,5 +2535,14 @@ var Data_Nullable_notNull any = func(x any) any { return x }
 // not a numeric conversion: the value is meaningless and the BITS are the
 // point, because QuickCheck uses it to derive a seed.
 var Test_QuickCheck_Gen_float32ToInt32 any = func(n any) any {
-	return int(int32(math.Float32bits(float32(n.(float64)))))
+	f := float32(n.(float64))
+	// NaN's bits are not portable: x86 arithmetic makes the negative "default
+	// NaN" (0xFFC00000 as float32), arm64 the positive quiet one. JS leaves the
+	// encoding to the engine, and V8 writes 0x7FC00000 on both, so a NaN is
+	// canonicalised to that rather than passed through. Without this,
+	// perturbGen of a NaN diverged from JS on linux/amd64 only.
+	if f != f {
+		return int(int32(0x7FC00000))
+	}
+	return int(int32(math.Float32bits(f)))
 }
