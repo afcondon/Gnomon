@@ -14,7 +14,7 @@ backfilled)"; 0007 records a decision visible only in the repo's shape.
 |---|---|---|
 | [0001](0001-runtime-representation.md) | Runtime representation | Accepted |
 | [0002](0002-statement-form-via-go-ast.md) | Statement-form via Go AST + gofmt | Accepted |
-| [0003](0003-tco-trampoline.md) | TCO trampoline | Accepted (was Deferred) |
+| [0003](0003-tco-trampoline.md) | TCO trampoline | Accepted (self tail calls as `for {}`, 2026-10-26) |
 | [0004](0004-module-layout.md) | Flat package, no loader | Accepted |
 | [0005](0005-ffi-doctrine.md) | FFI doctrine | Accepted |
 | [0006](0006-conformance-first.md) | Conformance-first | Accepted |

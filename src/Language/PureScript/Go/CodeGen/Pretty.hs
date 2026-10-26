@@ -122,6 +122,9 @@ forceRefs gen = goE
       GoBlockStmt body -> GoBlockStmt (map goS body)
       GoRawStmt t      -> GoRawStmt (patchTokens gen t)
       GoPanic m        -> GoPanic m
+      GoSet ns es      -> GoSet ns (map goE es)
+      GoFor body       -> GoFor (map goS body)
+      GoContinue       -> GoContinue
 
 -- | Patch generated-binding name tokens in opaque rendered Go text: each
 -- maximal identifier run that is a generated name becomes @_force(name)@.
@@ -161,6 +164,9 @@ prettyStmt = \case
   GoBlockStmt body -> "{\n" <> prettyStmts body <> "\n}"
   GoPanic msg      -> "panic(\"" <> msg <> "\")"
   GoRawStmt raw    -> raw
+  GoSet ns es      -> T.intercalate ", " ns <> " = " <> T.intercalate ", " (map prettyExpr es)
+  GoFor body       -> "for {\n" <> prettyStmts body <> "\n}"
+  GoContinue       -> "continue"
 
 prettyExpr :: GoExpr -> Text
 prettyExpr = \case

@@ -22,8 +22,8 @@
 --   * Arrays: @[]any@. Effects: @func() any@ thunks. Unit/undefined: nil.
 --
 -- Spike scope: Literal, Var, App, Abs, Case, Let, Accessor, ObjectUpdate,
--- Constructor. TCO trampoline (ADR 0003) and the Unused pass are deferred --
--- noted where they would attach.
+-- Constructor. Self tail calls compile to a @for {}@ loop (ADR 0003; see
+-- "Self tail calls" below); the Unused pass is ADR 0008.
 --
 module Language.PureScript.Go.CodeGen
   ( generateModule
@@ -55,16 +55,110 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
     currentModuleText = case currentModule of P.ModuleName mn -> mn
 
     -- One top-level binding -> one var decl (flat package, mangled name).
-    -- NB: TCO trampoline (ADR 0003) and smart Rec lazy-thunk partitioning
-    -- attach here; deferred for the spike. Rec is treated as a list of vars
-    -- (Go allows forward refs within a package; true value-cycles would need
-    -- the lazy-thunk helper -- not exercised by the spike modules).
+    -- Rec is treated as a list of vars (Go allows forward refs within a
+    -- package; value-cycles are resolved by the lazy init in Pretty.hs). A
+    -- binding that calls ITSELF in tail position becomes a loop (genRecBind);
+    -- mutual tail calls between bindings of one group stay ordinary calls.
     generateBind :: CoreFn.Bind CoreFn.Ann -> [GoDecl]
     generateBind (CoreFn.NonRec _ ident expr) =
       [ GoVarDecl (goTopName currentModule ident) (genExpr expr) ]
     generateBind (CoreFn.Rec bindings) =
-      [ GoVarDecl (goTopName currentModule ident) (genExpr expr)
+      [ GoVarDecl (goTopName currentModule ident) (genRecBind (topSelf ident) ident expr)
       | ((_, ident), expr) <- bindings ]
+
+    -- A reference to the top-level binding @ident@ of this module.
+    topSelf :: P.Ident -> SelfRef
+    topSelf ident (P.Qualified qb i) = i == ident && qb == P.ByModuleName currentModule
+
+    -- A reference to the let-bound @ident@ (locals are qualified by position).
+    localSelf :: P.Ident -> SelfRef
+    localSelf ident (P.Qualified qb i) = i == ident && case qb of
+      P.BySourcePos _ -> True
+      P.ByModuleName _ -> False
+
+    -- | One binding of a Rec group: a loop when TCO applies, else as usual.
+    genRecBind :: SelfRef -> P.Ident -> CoreFn.Expr CoreFn.Ann -> GoExpr
+    genRecBind isSelf ident expr = case tryTco isSelf ident expr of
+      Just (params, body) -> genTco isSelf params body
+      Nothing -> genExpr expr
+
+    -- ---------------------------------------------------------------
+    -- Self tail calls (ADR 0003)
+    -- ---------------------------------------------------------------
+    --
+    -- A binding @f = \p0 -> .. -> \pk -> body@ whose body calls @f@ with
+    -- exactly k+1 arguments, and only in tail position, compiles to
+    --
+    --   func(p0 any) any { return ... func(pk any) any {
+    --     _tco0, ..., _tcok := p0, ..., pk       // this call's own state
+    --     for {
+    --       p0 := _tco0; _ = p0                   // fresh per iteration
+    --       ...
+    --       <body; a tail call is `_tco0, .. = a0, ..; continue`,
+    --              any other tail value is `return e`>
+    --     }
+    --   } ... }
+    --
+    -- Two hazards shape it:
+    --
+    --   * Closure capture. A closure built in one iteration must keep THAT
+    --     iteration's values. Go closures capture variables, not values, so
+    --     the body reads fresh @:=@ copies declared inside the loop block,
+    --     never the loop state, which is reassigned.
+    --
+    --   * Partial application. The outer curried closures' parameters are
+    --     shared by every later application of the partially applied
+    --     function (@let f = go 0 in f 1 + f 2@). The loop therefore copies
+    --     them into state local to the innermost call and never writes them.
+    --
+    -- Tail positions are compiled as statements directly in the loop body
+    -- (through Case and Let, never into an IIFE), because @continue@ cannot
+    -- cross a function boundary. A self reference anywhere else -- an
+    -- argument, a scrutinee, a let right-hand side, inside a lambda, or an
+    -- unsaturated call -- disqualifies the binding, which then compiles as
+    -- plain recursion exactly as before. Mutual recursion is not looped.
+
+    genTco :: SelfRef -> [P.Ident] -> CoreFn.Expr CoreFn.Ann -> GoExpr
+    genTco isSelf params body =
+      let names = map identToGoName params
+          used = usedIdents body
+          -- A param the body can see: used, and not hidden by a later param
+          -- of the same name (only the last of duplicates is in scope).
+          live = [ p `Set.member` used && p `notElem` drop (i + 1) params
+                 | (i, p) <- zip [0 :: Int ..] params ]
+          st i = "_tco" <> tshow i
+          liveIx = [ (i, nm) | (i, nm, True) <- zip3 [0 :: Int ..] names live ]
+          inits = [ GoAssign (st i) (GoVar nm) | (i, nm) <- liveIx ]
+          -- `_ = p` keeps Go quiet when usedIdents over-approximates (it
+          -- ignores shadowing, so a param rebound by a pattern still counts).
+          copies = concat [ [ GoAssign nm (GoVar (st i)), GoSet ["_"] [GoVar nm] ]
+                          | (i, nm) <- liveIx ]
+          loopBody = copies ++ tailStmts isSelf live body
+          innermost = GoClosure (last names) (inits ++ [ GoFor loopBody ])
+      in foldr (\nm acc -> GoClosure nm [ GoReturn acc ]) innermost (init names)
+
+    -- | An expression in tail position of a TCO loop, as statements. Every
+    -- path ends in @continue@ (self call), @return@, or a pattern-match panic.
+    tailStmts :: SelfRef -> [Bool] -> CoreFn.Expr CoreFn.Ann -> [GoStmt]
+    tailStmts isSelf live = go
+      where
+        go expr = case selfCall isSelf (length live) expr of
+          Just args ->
+            let assigns =
+                  [ (if isLive then "_tco" <> tshow i else "_", e)
+                  | (i, isLive, a) <- zip3 [0 :: Int ..] live args
+                  , let e = genExpr a
+                  -- a dead argument is still evaluated, as JS evaluates it;
+                  -- but `_ = nil` is not legal Go, and nil has no effect.
+                  , isLive || e /= GoNil ]
+            in [ GoSet (map fst assigns) (map snd assigns) | not (null assigns) ]
+               ++ [ GoContinue ]
+          Nothing -> case expr of
+            -- Own block, so the let's names (and a nested let reusing them)
+            -- never collide with the loop's param copies.
+            CoreFn.Let _ binds body -> [ GoBlockStmt (genLetGroup binds body ++ go body) ]
+            CoreFn.Case _ scruts alts -> genCaseStmts go scruts alts
+            other -> [ GoReturn (genExpr other) ]
 
     -- | CoreFn expression -> GoExpr.
     genExpr :: CoreFn.Expr CoreFn.Ann -> GoExpr
@@ -129,7 +223,8 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
       foldr (\f acc -> GoClosure (identToGoName f) [ GoReturn acc ]) body fields
 
     -- | Let bindings -> statements. Local recursion via closure capture
-    -- (Go closures capture by reference). TCO for local @go@ deferred.
+    -- (Go closures capture by reference); a self-tail-recursive local @go@
+    -- becomes a loop (genRecBind).
     -- | A whole @let@ group. Each binding is emitted knowing what can still
     -- refer to it: every LATER binding's right-hand side, plus the let body.
     -- (A binding is routinely used only by its successor, never by the body —
@@ -158,16 +253,23 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
       -- Declare-then-assign so self/mutual refs resolve (Go := would not allow
       -- forward ref within a block). Use var + reassign.
       [ GoRawStmt ("var " <> identToGoName ident <> " any") | ((_, ident), _) <- bindings ] ++
-      [ GoRawStmt (identToGoName ident <> " = " <> prettyOf (genExpr expr))
+      [ GoRawStmt (identToGoName ident <> " = " <> prettyOf (genRecBind (localSelf ident) ident expr))
       | ((_, ident), expr) <- bindings ]
 
     -- | Case -> an IIFE whose body is a sequence of @if cond { return ... }@,
     -- one per alternative, ending in a panic (pattern-match failure).
     -- This is the statement-form replacement for Julia's ternary chain.
     genCase :: [CoreFn.Expr CoreFn.Ann] -> [CoreFn.CaseAlternative CoreFn.Ann] -> GoExpr
-    genCase scruts alts =
+    genCase scruts alts = GoIIFE (genCaseStmts (\b -> [ GoReturn (genExpr b) ]) scruts alts)
+
+    -- | The statements of a case, parameterised by how a result expression in
+    -- an alternative is finished: @return e@ inside genCase's IIFE, or the
+    -- loop-aware tail compilation of a TCO body.
+    genCaseStmts :: (CoreFn.Expr CoreFn.Ann -> [GoStmt])
+                 -> [CoreFn.Expr CoreFn.Ann] -> [CoreFn.CaseAlternative CoreFn.Ann] -> [GoStmt]
+    genCaseStmts finish scruts alts =
       let roots = [ GoVar ("_v" <> tshow i) | i <- [0 .. length scruts - 1] ]
-          altStmts = concatMap (genAlt roots) alts
+          altStmts = concatMap (genAlt finish roots) alts
           -- A scrutinee no pattern actually needs must NOT be bound: Go treats
           -- an unused local as a compile error. Decided STRUCTURALLY over the
           -- CoreFn binders (`rootLive`) rather than by scanning rendered Go for
@@ -185,11 +287,12 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
             | (i, e) <- zip [0 :: Int ..] scruts
             , rootLive i alts ]
           failStmt = GoPanic ("Pattern match failed in module " <> escapeGoString currentModuleText)
-      in GoIIFE (scrutBindings ++ altStmts ++ [ failStmt ])
+      in scrutBindings ++ altStmts ++ [ failStmt ]
 
     -- | One alternative -> an @if cond { binders; return body }@ block.
-    genAlt :: [GoExpr] -> CoreFn.CaseAlternative CoreFn.Ann -> [GoStmt]
-    genAlt roots alt@(CoreFn.CaseAlternative binders result) =
+    genAlt :: (CoreFn.Expr CoreFn.Ann -> [GoStmt])
+           -> [GoExpr] -> CoreFn.CaseAlternative CoreFn.Ann -> [GoStmt]
+    genAlt finish roots alt@(CoreFn.CaseAlternative binders result) =
       let patResults = zipWith genPattern roots binders
           conds = concatMap fst patResults
           -- Drop pattern binders the alternative never references: Go rejects an
@@ -200,10 +303,10 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
           used = Set.map identToGoName (altUsedIdents alt)
           binds = [ s | s <- concatMap snd patResults, goBindUsed used s ]
           bodyStmts = case result of
-            Right body -> binds ++ [ GoReturn (genExpr body) ]
+            Right body -> binds ++ finish body
             Left guards ->
               binds ++
-              [ GoIf (asBool (genExpr g)) [ GoReturn (genExpr b) ] | (g, b) <- guards ]
+              [ GoIf (asBool (genExpr g)) (finish b) | (g, b) <- guards ]
           cond = andAll conds
       in case cond of
            -- Unconditional alt: wrap in a block so its pattern binders are
@@ -281,6 +384,131 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
     psKey s = case decodeString s of
       Just str -> escapeGoString str
       Nothing  -> psStringToText s
+
+-- | Does a variable reference mean the binding being compiled?
+type SelfRef = P.Qualified P.Ident -> Bool
+
+-- | @f a1 .. an@ as @(f, [a1 .. an])@.
+unApp :: CoreFn.Expr CoreFn.Ann -> (CoreFn.Expr CoreFn.Ann, [CoreFn.Expr CoreFn.Ann])
+unApp = go []
+  where
+    go args (CoreFn.App _ fn arg) = go (arg : args) fn
+    go args other = (other, args)
+
+-- | The arguments of a self call saturated at exactly @n@ arguments.
+selfCall :: SelfRef -> Int -> CoreFn.Expr CoreFn.Ann -> Maybe [CoreFn.Expr CoreFn.Ann]
+selfCall isSelf n e@(CoreFn.App {}) = case unApp e of
+  (CoreFn.Var _ q, args) | isSelf q && length args == n -> Just args
+  _ -> Nothing
+selfCall _ _ _ = Nothing
+
+peelAbs :: CoreFn.Expr CoreFn.Ann -> ([P.Ident], CoreFn.Expr CoreFn.Ann)
+peelAbs (CoreFn.Abs _ arg body) = let (ps, b) = peelAbs body in (arg : ps, b)
+peelAbs other = ([], other)
+
+-- | TCO applicability, after Jurist's @tryTco@: a lambda chain whose body
+-- calls itself at least once, and ONLY as saturated tail calls. Also refused
+-- when anything inside rebinds the name (a param, let or pattern called the
+-- same), since then a syntactic match on the name is not a self reference.
+tryTco :: SelfRef -> P.Ident -> CoreFn.Expr CoreFn.Ann
+       -> Maybe ([P.Ident], CoreFn.Expr CoreFn.Ann)
+tryTco isSelf self expr =
+  let (params, body) = peelAbs expr
+      n = length params
+  in if n > 0 && self `notElem` params && not (rebinds self body)
+          && hasSelfTailCall isSelf n body && tcoOk isSelf n body
+       then Just (params, body)
+       else Nothing
+
+-- | Is there a saturated self call in some tail position?
+hasSelfTailCall :: SelfRef -> Int -> CoreFn.Expr CoreFn.Ann -> Bool
+hasSelfTailCall isSelf n = go
+  where
+    go expr = case selfCall isSelf n expr of
+      Just _ -> True
+      Nothing -> case expr of
+        CoreFn.Case _ _ alts -> any altHas alts
+        CoreFn.Let _ _ body -> go body
+        _ -> False
+    altHas (CoreFn.CaseAlternative _ result) = case result of
+      Right b -> go b
+      Left guards -> any (go . snd) guards
+
+-- | Every self reference is a saturated call in tail position.
+tcoOk :: SelfRef -> Int -> CoreFn.Expr CoreFn.Ann -> Bool
+tcoOk isSelf n = go True
+  where
+    noSelf = not . mentions isSelf
+    go tailPos expr = case expr of
+      e@(CoreFn.App {}) -> case selfCall isSelf n e of
+        Just args -> tailPos && all noSelf args
+        Nothing -> noSelf e
+      CoreFn.Case _ scruts alts ->
+        let altOk (CoreFn.CaseAlternative _ result) = case result of
+              Right b -> go tailPos b
+              Left guards -> all (\(g, b) -> noSelf g && go tailPos b) guards
+        in all noSelf scruts && all altOk alts
+      CoreFn.Let _ binds body ->
+        let bindOk (CoreFn.NonRec _ _ e) = noSelf e
+            bindOk (CoreFn.Rec bs) = all (noSelf . snd) bs
+        in all bindOk binds && go tailPos body
+      other -> noSelf other
+
+-- | Does the expression reference the binding anywhere at all?
+mentions :: SelfRef -> CoreFn.Expr CoreFn.Ann -> Bool
+mentions isSelf = go
+  where
+    go = \case
+      CoreFn.Var _ q -> isSelf q
+      CoreFn.Literal _ lit -> case lit of
+        CoreFn.ArrayLiteral es -> any go es
+        CoreFn.ObjectLiteral fs -> any (go . snd) fs
+        _ -> False
+      CoreFn.Constructor {} -> False
+      CoreFn.Accessor _ _ e -> go e
+      CoreFn.ObjectUpdate _ e _ fs -> go e || any (go . snd) fs
+      CoreFn.Abs _ _ body -> go body
+      CoreFn.App _ f a -> go f || go a
+      CoreFn.Case _ scruts alts -> any go scruts || any goAlt alts
+      CoreFn.Let _ binds body -> go body || any goBind binds
+    goAlt (CoreFn.CaseAlternative _ result) = case result of
+      Right b -> go b
+      Left guards -> any (\(g, b) -> go g || go b) guards
+    goBind (CoreFn.NonRec _ _ e) = go e
+    goBind (CoreFn.Rec bs) = any (go . snd) bs
+
+-- | Does anything inside bind the identifier (lambda, let, or pattern)?
+rebinds :: P.Ident -> CoreFn.Expr CoreFn.Ann -> Bool
+rebinds x = go
+  where
+    go = \case
+      CoreFn.Literal _ lit -> case lit of
+        CoreFn.ArrayLiteral es -> any go es
+        CoreFn.ObjectLiteral fs -> any (go . snd) fs
+        _ -> False
+      CoreFn.Var {} -> False
+      CoreFn.Constructor {} -> False
+      CoreFn.Accessor _ _ e -> go e
+      CoreFn.ObjectUpdate _ e _ fs -> go e || any (go . snd) fs
+      CoreFn.Abs _ arg body -> arg == x || go body
+      CoreFn.App _ f a -> go f || go a
+      CoreFn.Case _ scruts alts -> any go scruts || any goAlt alts
+      CoreFn.Let _ binds body -> go body || any goBind binds
+    goAlt (CoreFn.CaseAlternative binders result) =
+      any binderBinds binders || case result of
+        Right b -> go b
+        Left guards -> any (\(g, b) -> go g || go b) guards
+    goBind (CoreFn.NonRec _ i e) = i == x || go e
+    goBind (CoreFn.Rec bs) = any (\((_, i), e) -> i == x || go e) bs
+    binderBinds = \case
+      CoreFn.NullBinder _ -> False
+      CoreFn.VarBinder _ i -> i == x
+      CoreFn.NamedBinder _ i b -> i == x || binderBinds b
+      CoreFn.ConstructorBinder _ _ _ bs -> any binderBinds bs
+      CoreFn.LiteralBinder _ lit -> case lit of
+        CoreFn.ArrayLiteral bs -> any binderBinds bs
+        CoreFn.ObjectLiteral fs -> any (binderBinds . snd) fs
+        _ -> False
 
 -- | Combine conditions with &&; Nothing means "always true".
 andAll :: [GoExpr] -> Maybe GoExpr
