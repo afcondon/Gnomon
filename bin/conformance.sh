@@ -47,6 +47,19 @@ if [[ "$ONLY" == "both" || "$ONLY" == "optimizer" ]]; then
 fi
 
 if [[ "$ONLY" == "both" || "$ONLY" == "oracle" ]]; then
+  # The drift gate's baseline (perf/baseline.json) was recorded on an M4 MBP,
+  # and its ratios do not transfer to other machine classes: the first run on
+  # GitHub's x86 runners (2026-10-26) put gated JS rows at 2.17x and 0.38x of
+  # baseline with nothing changed. So the gate runs only where the baseline was
+  # measured. CI sets PERF_GATE_DRIFT=0: checksums still gate, drift is still
+  # printed, and an annotation says the drift gate was NOT run. Locally it
+  # defaults on, exactly as before.
+  if [[ "${PERF_GATE_DRIFT:-1}" == "1" ]]; then
+    perf_drift_flag=(--gate-drift)
+  else
+    perf_drift_flag=()
+    echo "::warning title=Perf drift gate NOT RUN::perf/baseline.json is M4-calibrated; on this machine drift is reported, not gated. Checksums still gate."
+  fi
   echo "==> performance canary (perf)"
   # Gates on CHECKSUMS — the shapes must compute the same answers on both
   # backends, and a benchmark that is quietly wrong is how a perf suite stays
@@ -61,7 +74,7 @@ if [[ "$ONLY" == "both" || "$ONLY" == "oracle" ]]; then
   # and only above an absolute floor where the timing carries information — the
   # worst spread was 1.69x and the median 1.10x. See CALIBRATION,
   # GATE_MIN_STEADY_US and TOLERANCE in run_perf.py.
-  ( cd perf && python3 run_perf.py --gate-drift )
+  ( cd perf && python3 run_perf.py ${perf_drift_flag[@]+"${perf_drift_flag[@]}"} )
 fi
 
 echo "==> conformance lane GREEN"
