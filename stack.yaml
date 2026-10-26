@@ -1,7 +1,10 @@
+# lts-23.18 is GHC 9.8.4. With system-ghc, the GHC on PATH must BE 9.8.4:
+# stack checks this (skip-ghc-check is deliberately off), so a mismatch fails
+# as "compiler version mismatch" instead of a cryptic pruned-boot-package
+# build plan. CI pins the same version in .github/workflows/ci.yaml.
 resolver: lts-23.18
 system-ghc: true
 install-ghc: false
-skip-ghc-check: true
 pvp-bounds: both
 packages:
   - .

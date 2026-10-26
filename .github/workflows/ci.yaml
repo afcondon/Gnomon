@@ -39,18 +39,25 @@ jobs:
   ci:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the label moves to Ubuntu 26 from 2026-10-19,
+    # and GHCup bindists for a new image lag. Bump deliberately.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      # NOTE: this toolchain setup is best-effort and unvalidated against the
-      # Actions runner — the first CI run may need version pins adjusted. The
-      # conformance LOGIC (bin/conformance.sh) is validated locally.
+      # GHC must be the resolver's compiler: lts-23.18 = GHC 9.8.4. stack.yaml
+      # uses system-ghc (for the Nix shell), so whatever GHC this step puts on
+      # PATH is the one stack builds with. Unpinned, the action installs the
+      # newest GHC; its boot packages (directory, filepath, ...) then conflict
+      # with the snapshot and stack fails with "[S-4804] ... this GHC boot
+      # package has been pruned", which is how CI has failed since 2026-07-20.
+      # Bump this together with the resolver, never alone.
       - name: Setup Haskell / Stack
         uses: haskell-actions/setup@v2
         with:
+          ghc-version: "9.8.4"
           enable-stack: true
-          stack-version: latest
+          stack-version: "3.9.3"
 
       # Restore + (later) always-save, rather than actions/cache's combined
       # form: the combined form only saves in a post-step that is skipped when
@@ -64,8 +71,8 @@ jobs:
           path: |
             ~/.stack
             .stack-work
-          key: ${{ runner.os }}-stack-${{ hashFiles('stack.yaml.lock', 'package.yaml') }}
-          restore-keys: ${{ runner.os }}-stack-
+          key: ${{ runner.os }}-ghc-9.8.4-stack-${{ hashFiles('stack.yaml.lock', 'package.yaml') }}
+          restore-keys: ${{ runner.os }}-ghc-9.8.4-stack-
 
       - uses: actions/setup-node@v4
         with:
@@ -87,7 +94,21 @@ jobs:
           python-version: "3.x"
 
       - name: Conformance lane
-        run: bin/conformance.sh
+        # The perf drift gate is calibrated on an M4; see bin/conformance.sh.
+        env:
+          PERF_GATE_DRIFT: "0"
+        run: |
+          set -o pipefail
+          bin/conformance.sh 2>&1 | tee conformance.log
+
+      # Put the tail of a failing lane into an annotation, so the cause shows
+      # on the run summary page and in the API without opening the full log.
+      - name: Summarise a failing lane
+        if: failure()
+        run: |
+          [ -f conformance.log ] || exit 0
+          tail -n 40 conformance.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' > tail.txt
+          echo "::error title=Conformance lane (last 40 lines)::$(cat tail.txt)"
 
       # Save even when the lane fails: the expensive part (the cold stack build
       # of purs-as-library + psgo) has already populated the cache dirs by
@@ -100,7 +121,7 @@ jobs:
           path: |
             ~/.stack
             .stack-work
-          key: ${{ runner.os }}-stack-${{ hashFiles('stack.yaml.lock', 'package.yaml') }}
+          key: ${{ runner.os }}-ghc-9.8.4-stack-${{ hashFiles('stack.yaml.lock', 'package.yaml') }}
 
   # The single required status check. Always runs; green when `ci` passed OR was
   # skipped (docs-only), red when it failed or was cancelled. Point branch
