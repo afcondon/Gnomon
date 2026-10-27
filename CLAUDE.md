@@ -47,18 +47,19 @@ is: **divergence is surfaced, never concealed.**
 
 **Should this be on another runtime at all?** Decide in this order:
 
-- **Capability:** it is impossible on JS (a CAS, a static binary). Go; the
-  cost of crossing the seam is a design input, not a decision input.
+- **Capability:** it is impossible on JS (a CAS, a static binary). Proceed:
+  the cost of crossing the seam is a design input, not a decision input.
 - **Frontier:** the point is a foreign library. Price the seam:
   `tax ≈ 1 + prop + (fixed_µs + perNumber_ns × N/1000) / W`, where W is the
   µs of library work per crossing and N is the Numbers PureScript folds per
   crossing. Measured fixed costs are about 1.7 µs on Go, 6.6 µs on Julia
   and 8.0 µs on Python, plus well under 1 % of the call. A tax over 1.05
   means the seam is too fine-grained, not that the runtime is too slow.
-- **Neither:** stay on JS. Whether your own code runs faster on another
-  backend is **unmeasured**, and the structural reasons (V8's JIT; curried
-  closures and `Effect` thunks in our output) point the other way. Never
-  claim, or chase, a same-algorithm speed-up.
+- **Neither:** stay on JS. Where the same source has been measured on
+  another backend it was slower: hot numeric loops on Julia ran about 70×
+  slower than on Node. Elsewhere it is unmeasured, and the structural
+  reasons (V8's JIT; curried closures and `Effect` thunks in our output)
+  point the same way. Never claim, or chase, a same-algorithm speed-up.
 
 **The seam rule.** The FFI holds a call into a foreign library, **never your
 algorithm**. A core that is FFI-free compiles under the stock JS backend too,
@@ -98,20 +99,37 @@ the win through it.
 
 - **The JavaScript backend is the reference.** The shared `Test.*` corpus
   (identical in all three repos, FFI-free) is compiled once, run on JS and
-  on this backend, and diffed line for line. Byte-identical is a pass.
-- **The divergence ledger** (`KNOWN_DIVERGENCES` in
-  `test-suite/run_tests.py`) is the finite, enumerated list of deliberate
-  differences, each with the JS value shown: `ASTRAL-` (UTF-16 code units
-  against code points), `INT64-` (int32 wrap against wider ints), `STACK`,
-  `NEGZERO`. An entry is a claim about a value, not an exemption from
-  checking.
+  on this backend, and diffed line for line, including the lines that are
+  not `TEST` results. A line passes if it is byte-identical, or if it
+  matches a ledger entry exactly.
+- **The divergence ledger** is the finite, enumerated list of deliberate
+  differences. From the X3 harness work on (October 2026) it is
+  `test-suite/divergences.json`. Each entry records the JS value, this
+  backend's value and a cause, and one judge (`test-suite/ledger.py`) serves
+  every lane:
+  - **MISMATCH** when a value moves off its recorded one;
+  - **STALE** when an entry stops being needed.
+
+  Causes include `INT32-WRAP` (JS wraps Int to 32 bits), `REM-ZERO`,
+  `ASTRAL` (UTF-16 code units against code points), `NEGZERO` and `STACK`.
+  The cause is a field, so no rule may depend on a test's name. Before X3
+  the ledger was a bare list of names that passed whatever they printed.
+  That is the hole X3 closed; don't reintroduce it.
 - **Two implementations, on purpose.** The Haskell compiler walking raw
-  CoreFn is the correctness **oracle**. The PureScript implementation
-  `backend-*/`, which consumes `purescript-backend-optimizer`'s IR, is the
-  fast path. Both run over the same corpus, and the optimizer lane must not
-  carry its own fork of the runtime or the shims.
-- **`tests/purs/passing`**, the compiler team's own suite, is the second
-  corpus, because ours only covers cases someone thought of.
+  CoreFn is the reference implementation, and the correctness claims rest on
+  it. The PureScript implementation `backend-*/`, which consumes
+  `purescript-backend-optimizer`'s IR, is the fast path. **Both lanes are
+  diffed against JS**, not against each other. The Haskell side only
+  supplies the runtime and shims that the optimizer lane must reuse rather
+  than fork.
+- **`tests/purs/passing`**, the compiler team's own suite, is a second
+  corpus, because ours only covers cases someone thought of. It is run by
+  hand through the sibling `purs-corpus` harness, and **nothing gates on
+  it**.
+- **Know what "CI is green" vouches for.** It covers the oracle lane and the
+  perf checksums. CI has no `purescript-backend-optimizer` checkout and no
+  machine baseline, so the optimizer lane and the perf drift gate show
+  **NOT RUN** there. Run them locally before claiming them.
 - **A claim is whatever the gate says, and nothing more.** Our ADRs and
   READMEs have been wrong: an ADR claimed TCO the code didn't have, and a
   README claimed an `Int` wrap that didn't happen. Verify against the code
@@ -135,8 +153,16 @@ the win through it.
   edited by overwrite. Numbering is per repo, so name the repo when citing an
   ADR from outside it.
 - **Performance claims** come from the repo's own canaries (`perf/`,
-  `perf-seam/`), as before and after, with the machine named. A drift
-  baseline from one machine does not transfer to another.
+  `perf-seam/`), as before and after, with the machine named. From X3 on,
+  drift is gated three ways:
+  - **per-machine baselines** in `perf/baselines/<host>-<cpu>.json`, because
+    a baseline from one machine does not transfer to another;
+  - a **speed index against JS**, which catches a change that moves every
+    benchmark at once;
+  - **`--repeat`**, with a NOISY label when runs disagree.
+
+  A deliberate speed change re-records this machine's baseline
+  (`--update-baseline`) in the same PR.
 - **Read the existing docs before designing.** The big decisions (runtime
   representation, the FFI doctrine, TCO, conformance) are in the ADRs, and a
   change that reverses one needs a new ADR, not just code.
@@ -147,11 +173,12 @@ the win through it.
     lane).
   - *ledger*: the divergence list.
   - *canary*: a regression guard. The performance canary measures each
-    backend against itself. Jurist also has a representation canary,
-    which pins its ADR-0001 table.
-  - *oracle*: whatever a lane is checked against. That is JS in the
-    differential suite, the Haskell implementation in the optimizer lane,
-    and GHC for `Haskell.*` modules. Pythia's nickname, "the oracle", is
+    backend against its own baseline and, from X3 on, against JS. Jurist
+    also has a representation canary, which pins its ADR-0001 table.
+  - *oracle*: whatever a lane is checked against. That is JS for both
+    implementations here, and GHC for `Haskell.*` modules. The Haskell
+    implementation is also called "the oracle" in the ADRs, meaning the
+    reference implementation. Pythia's nickname, "the oracle", is
     unrelated.
 
 <!-- END FAMILY SECTION -->
@@ -188,7 +215,8 @@ work that converges them.
 - **Liveness:** structural, via the Unused pass ([ADR-0008](docs/design-decisions/0008-unused-pass.md)).
 - **Tail calls:** self tail calls compile to a `for {}` loop since
   2026-10-26 ([ADR-0003](docs/design-decisions/0003-tco-trampoline.md)).
-  Before that there was no TCO at all, whatever the ADR said.
+  Before that there was no TCO at all, whatever the ADR said. Only *self*
+  tail calls are covered: mutual recursion still grows the stack.
 
 **`Int` does not wrap to int32**, although Go has `int32` natively and an
 old README claimed it wrapped. Whether to make it int32 is an **open
@@ -216,18 +244,18 @@ The toolchain comes from Nix via `.envrc`. Run `stack` inside that shell.
 CI pins GHC 9.8.4 to match `lts-23.18`.
 
 **Known traps:**
-- **`psgo` exits 0 on some failures**: a CoreFn parse error, a gofmt error,
-  an unknown `--entry`. Never trust its exit code alone; check that it
-  wrote the output.
+- **`psgo` exits 0 on failure**: a CoreFn parse error, a gofmt error, an
+  unknown `--entry`. There is no `exitFailure` anywhere in `app/` or
+  `src/`. Until that small fix lands, never trust its exit code alone, and
+  check that it wrote the output.
 - The oracle lane runs `go run main.go prelude.go`, so it never compiles
   user FFI.
-- The performance canary guards only `psgo`, so `backend-go` has no
-  regression guard yet.
-- `Pretty.hs`'s `patchTokens` rewrites identifier tokens in rendered text,
+- On `main`, the performance canary guards only `psgo`. The X3 harness PR
+  adds a `backend-go` runner.
+- `patchTokens` (`src/Language/PureScript/Go/CodeGen/Pretty.hs`) rewrites identifier tokens in rendered text,
   possibly including inside string literals. User locals keep their
   PureScript names, so `_m` and `_force` can be captured.
 - The optimizer lane takes `purescript-backend-optimizer` as an unpinned
   sibling checkout, and upstream `b8d96a9` broke it. Pin to `4810dc0` until
   that is fixed.
-- The conformance scripts write to fixed `/tmp` paths, so don't run two at
-  once.
+
