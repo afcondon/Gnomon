@@ -83,6 +83,11 @@ be exactly `0.3`).
 - Generated code grows about 15 % (an extra func per known function), and
   `go build` of the corpus took about 40 % longer on the Mini under load.
   `psgo` itself did not get measurably slower. The numbers are in the PR.
+- In backend-go, a saturated func whose body only builds a closure (an
+  Effect thunk, a lambda) is marked `//go:noinline`. Go inlined such a func
+  into its curried wrapper, closures and all, and the copies ran 7–10 %
+  slower on `ffi-call` and `loop-fore` with byte-identical hot code; the
+  directive recovered it. A func that computes is left for Go to inline.
 - Only *top-level* bindings are saturated. A local `let` function and a call
   through a dictionary method stay curried, unless the dictionary is known
   and the op is one of the inlined primitives.
