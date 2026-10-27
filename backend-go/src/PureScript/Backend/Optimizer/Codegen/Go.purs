@@ -15,10 +15,13 @@
 -- |     `EsCall hd [oneArg]` spine (Codegen/EcmaScript/Convert.purs), and purescm
 -- |     emits `mkCurriedFn` / `runCurriedFn` = nested unary lambdas. Native
 -- |     multi-arg is reserved for the `Uncurried*` (Fn/EffectFn) nodes below --
--- |     which we already emit natively. There is NO safe "emit native n-ary from
+-- |     which we already emit natively. ~~There is NO safe "emit native n-ary from
 -- |     ordinary Abs/App" win: the optimizer's `App f args` is a syntactic spine,
 -- |     not a saturation guarantee (f may be partially/over-applied), so a native
--- |     `f(a,b,c)` would be unsound.
+-- |     `f(a,b,c)` would be unsound.~~ Superseded 2026-10-27 (ADR-0009): true
+-- |     for an unknown head, false for a top-level `Abs` of arity n applied to
+-- |     >= n arguments. Such a binding also gets `func _sat_X(p1..pn)`, and a
+-- |     call with enough arguments goes straight to it (`knownArities`).
 -- |   * TCO (Stage 1): single self-recursive TOP-LEVEL functions whose optimizer
 -- |     TcoRole is `isLoop` are emitted as a Go `for {}` dispatch loop (see
 -- |     `loopInit`/`genStmts`) instead of stack recursion. The analysis is the
@@ -35,6 +38,7 @@
 module PureScript.Backend.Optimizer.Codegen.Go
   ( CodegenOptions
   , codegenModule
+  , knownArities
   ) where
 
 import Prelude
@@ -47,7 +51,9 @@ import Data.Array.NonEmpty as NEA
 import Data.Char (toCharCode)
 import Data.Foldable (foldMap)
 import Data.Int as Int
-import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Map (Map)
+import Data.Map as Map
+import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.Monoid (power)
 import Data.Newtype (unwrap)
 import Data.Number as Number
@@ -64,12 +70,50 @@ import PureScript.Backend.Optimizer.Codegen.Tco (TcoAnalysis(..), TcoExpr(..), T
 import PureScript.Backend.Optimizer.Semantics (NeutralExpr)
 import PureScript.Backend.Optimizer.Syntax (BackendAccessor(..), BackendEffect(..), BackendOperator(..), BackendOperator1(..), BackendOperator2(..), BackendOperatorNum(..), BackendOperatorOrd(..), BackendSyntax(..), Level(..), Pair(..))
 
-type CodegenOptions = { intTags :: Boolean }
+type CodegenOptions = { intTags :: Boolean, arities :: Map (Qualified Ident) Int }
+
+-- | What every emitter needs from the whole program: the arity of each
+-- | top-level function a call can be saturated against (ADR-0009).
+type Env = { arities :: Map (Qualified Ident) Int }
+
+-- | The Go func behind saturated calls of a top-level binding. Generated
+-- | top-level names start with a module name, so never with `_`.
+satName :: String -> String
+satName name = "_sat_" <> name
+
+-- | The arity map (ADR-0009): every top-level binding that is an `Abs`, over
+-- | every module that will be emitted, so a call in one module is saturated
+-- | against a definition in another. Foreigns are not bindings and stay
+-- | curried. A mutually recursive loop group is left out: its members are
+-- | wrappers over one dispatch loop, and stay curried.
+knownArities :: Array BackendModule -> Map (Qualified Ident) Int
+knownArities mods = Map.fromFoldable do
+  mod <- mods
+  grp <- mod.bindings
+  case NEA.fromArray grp.bindings of
+    Nothing -> []
+    Just binds -> do
+      let analyzed = analyzeGroup mod.name grp.recursive binds
+      guard (not (mutualLoop mod.name grp.recursive analyzed))
+      Tuple ident e <- NEA.toArray analyzed
+      case absParams e of
+        Just { params } -> [ Tuple (Qualified (Just mod.name) ident) (NEA.length params) ]
+        Nothing -> []
+
+analyzeGroup :: ModuleName -> Boolean -> NonEmptyArray (Tuple Ident NeutralExpr) -> NonEmptyArray (Tuple Ident TcoExpr)
+analyzeGroup mn recursive binds =
+  let env = if recursive then topLevelTcoEnvGroup mn binds else []
+  in map (\(Tuple i e) -> Tuple i (analyze env e)) binds
+
+mutualLoop :: ModuleName -> Boolean -> NonEmptyArray (Tuple Ident TcoExpr) -> Boolean
+mutualLoop mn recursive analyzed = recursive && NEA.length analyzed > 1 && isJust do
+  refBindings <- topLevelTcoRefBindings mn analyzed
+  guard (tcoRoleIsLoop refBindings)
 
 -- | Top-level entry called from Main's onCodegenModule. Builds Go source as a
 -- | String and wraps it in a single Dodo text node (gofmt does the layout).
 codegenModule :: forall a. CodegenOptions -> BackendModule -> Dodo.Doc a
-codegenModule _ mod =
+codegenModule opts mod =
   Dodo.text $ String.joinWith "\n"
     [ "package main"
     , ""
@@ -81,7 +125,8 @@ codegenModule _ mod =
     , "}"
     ]
   where
-  groups = map (genGroup mod.name) mod.bindings
+  env = { arities: opts.arities }
+  groups = map (genGroup env mod.name) mod.bindings
 
 -- | Emit one top-level binding group: its `var X any` decls and its `init()`
 -- | assignment lines. Every binding is a memoized lazy thunk (purs $runtime_lazy
@@ -89,29 +134,87 @@ codegenModule _ mod =
 -- | nothing can be eagerly ordered and references are forced on use (see genExpr
 -- | Var). A single self-recursive function whose optimizer role is `isLoop` is
 -- | emitted as a `for {}` dispatch loop instead of stack recursion.
-genGroup :: ModuleName -> BackendBindingGroup Ident NeutralExpr -> { decls :: Array String, inits :: Array String }
-genGroup mn grp = case NEA.fromArray grp.bindings of
+genGroup :: Env -> ModuleName -> BackendBindingGroup Ident NeutralExpr -> { decls :: Array String, inits :: Array String }
+genGroup env mn grp = case NEA.fromArray grp.bindings of
   Nothing -> { decls: [], inits: [] }
   Just binds ->
     let
-      env = if grp.recursive then topLevelTcoEnvGroup mn binds else []
-      analyzed = map (\(Tuple i e) -> Tuple i (analyze env e)) binds
+      analyzed = analyzeGroup mn grp.recursive binds
     in
-      case if grp.recursive then loopPairs mn analyzed else Nothing of
+      case NEA.toArray analyzed, (if grp.recursive then loopPairs env mn analyzed else Nothing) of
+        -- A single self-recursive loop with a saturated entry point: the
+        -- loop lives in the func, the curried var wraps it.
+        [ Tuple ident e ], Just _
+          | Just lb <- loopBindingOf (Tuple ident e)
+          , Map.member (Qualified (Just mn) ident) env.arities ->
+              let
+                name = topName mn ident
+                loop = selfLoop env (loopTag (NEA.singleton lb)) (TcoTopLevel (Qualified (Just mn) ident)) lb.params lb.body
+              in
+                { decls: [ "var " <> name <> " any", satFunc name loop.copies loop.block ]
+                , inits: [ name <> " = _lazy(func() any { return " <> satWrapper name (Array.length loop.copies) <> " })" ]
+                }
         -- loop pairs carry their own names (incl. the synthetic internal mutual
         -- name), so derive decls from them rather than from the group idents.
-        Just pairs ->
+        _, Just pairs ->
           { decls: map (\(Tuple nm _) -> "var " <> nm <> " any") pairs
           , inits: map (\(Tuple nm expr) -> nm <> " = _lazy(func() any { return " <> expr <> " })") pairs
           }
-        Nothing ->
-          { decls: map (\(Tuple ident _) -> "var " <> topName mn ident <> " any") (NEA.toArray binds)
-          , inits: map (normalInit mn) (NEA.toArray analyzed)
+        _, Nothing ->
+          { decls: NEA.toArray analyzed >>= \(Tuple ident e) ->
+              [ "var " <> topName mn ident <> " any" ] <> case satEntry ident e of
+                Just { params, body } ->
+                  [ noInline body
+                      <> satFunc (topName mn ident) (map (\(Tuple mbI lvl) -> localName mbI lvl) params)
+                        ("return " <> genExpr env body) ]
+                Nothing -> []
+          , inits: map (\(Tuple ident e) -> case satEntry ident e of
+                Just { params } ->
+                  topName mn ident <> " = _lazy(func() any { return "
+                    <> satWrapper (topName mn ident) (Array.length params) <> " })"
+                Nothing -> normalInit env mn (Tuple ident e))
+              (NEA.toArray analyzed)
           }
+  where
+  satEntry ident e = do
+    guard (Map.member (Qualified (Just mn) ident) env.arities)
+    { params, body } <- absParams e
+    pure { params: NEA.toArray params, body }
 
-normalInit :: ModuleName -> Tuple Ident TcoExpr -> String
-normalInit mn (Tuple ident body) =
-  topName mn ident <> " = _lazy(func() any { return " <> genExpr body <> " })"
+-- | A saturated func whose body only builds a closure (an Effect thunk, a
+-- | lambda) gains nothing from Go inlining it into its caller, and loses:
+-- | Go copies the closures into the curried wrapper with it, and those copies
+-- | ran 7-10 % slower (perf ffi-call and loop-fore, Mac Mini M4, 2026-10-27;
+-- | identical hot code, recovered with this directive). Inlining a func that
+-- | computes is left to Go.
+noInline :: TcoExpr -> String
+noInline (TcoExpr _ syn) = case syn of
+  EffectBind _ _ _ _ -> directive
+  EffectPure _ -> directive
+  EffectDefer _ -> directive
+  PrimEffect _ -> directive
+  Abs _ _ -> directive
+  UncurriedAbs _ _ -> directive
+  UncurriedEffectAbs _ _ -> directive
+  _ -> ""
+  where
+  directive = "//go:noinline\n"
+
+-- | `func _sat_X(p0 any, .., pn any) any { body }`
+satFunc :: String -> Array String -> String -> String
+satFunc name params body =
+  "func " <> satName name <> "(" <> commaSep (map (_ <> " any") params) <> ") any {\n" <> body <> "\n}"
+
+-- | The curried closure of a binding with a saturated entry point: a thin
+-- | wrapper that collects n arguments and calls it.
+satWrapper :: String -> Int -> String
+satWrapper name n =
+  let args = map (\i -> "_a" <> show i) (Array.range 0 (n - 1))
+  in curriedReturn args (satName name <> "(" <> commaSep args <> ")")
+
+normalInit :: Env -> ModuleName -> Tuple Ident TcoExpr -> String
+normalInit env mn (Tuple ident body) =
+  topName mn ident <> " = _lazy(func() any { return " <> genExpr env body <> " })"
 
 --------------------------------------------------------------------------------
 -- TCO (Stage 1): single self-recursive top-level loops
@@ -148,24 +251,25 @@ loopTag members = case NEA.head (NEA.head members).params of Tuple _ (Level n) -
 -- | mutually-recursive group this includes one synthetic internal-loop name plus
 -- | a wrapper per member; the internal name is forced on reference like any other
 -- | top-level binding (refName = `_force`).
-loopPairs :: ModuleName -> NonEmptyArray (Tuple Ident TcoExpr) -> Maybe (Array (Tuple String String))
-loopPairs mn analyzed = do
+loopPairs :: Env -> ModuleName -> NonEmptyArray (Tuple Ident TcoExpr) -> Maybe (Array (Tuple String String))
+loopPairs env mn analyzed = do
   refBindings <- topLevelTcoRefBindings mn analyzed
   guard (tcoRoleIsLoop refBindings)
   members <- traverse loopBindingOf analyzed
-  pure $ loopBindings (topName mn) (TcoTopLevel <<< Qualified (Just mn)) (\n -> "_force(" <> n <> ")") members
+  pure $ loopBindings env (topName mn) (TcoTopLevel <<< Qualified (Just mn)) (\n -> "_force(" <> n <> ")") members
 
 -- | Build the Go (name, valueExpr) pairs for one isLoop group: a single closure
 -- | for a self-recursive function, or an internal branch-dispatch loop plus one
 -- | curried wrapper per member for a mutually-recursive group.
 loopBindings
-  :: (Ident -> String)   -- how a member ident is named in Go
+  :: Env
+  -> (Ident -> String)   -- how a member ident is named in Go
   -> (Ident -> TcoRef)   -- how a member ident's calls are recognised
   -> (String -> String)  -- how to reference the synthetic internal mutual name
   -> NonEmptyArray LoopBinding
   -> Array (Tuple String String)
-loopBindings nameOf refOf refName members = case NEA.toArray members of
-  [ m ] -> [ Tuple (nameOf m.ident) (selfLoopClosure tag (refOf m.ident) m.params m.body) ]
+loopBindings env nameOf refOf refName members = case NEA.toArray members of
+  [ m ] -> [ Tuple (nameOf m.ident) (selfLoopClosure env tag (refOf m.ident) m.params m.body) ]
   ms -> Array.cons (Tuple internalName internalFunc) (Array.mapWithIndex memberWrapper ms)
   where
   tag = loopTag members
@@ -197,7 +301,7 @@ loopBindings nameOf refOf refName members = case NEA.toArray members of
         (NEA.toArray m.params)
     in
       "if _truthy(_intEq(" <> branchReg <> ", " <> show idx <> ")) {\n"
-        <> String.joinWith "\n" (perIterBinds <> [ genStmts ctx m.body ])
+        <> String.joinWith "\n" (perIterBinds <> [ genStmts env ctx m.body ])
         <> "\n}"
 
   -- f = func(p0)..(pn) { return _internal(idx, p0..pn, nil-pad to maxArity) }
@@ -227,11 +331,26 @@ loopBindings nameOf refOf refName members = case NEA.toArray members of
 -- | int-counter + float-accumulator loop falls back -- per-register typing is the
 -- | post-MVP calling-convention work). Successful emission IS the soundness
 -- | proof, so this never regresses.
-selfLoopClosure :: String -> TcoRef -> NonEmptyArray (Tuple (Maybe Ident) Level) -> TcoExpr -> String
-selfLoopClosure tag ref params body =
-  case tryKind KInt <|> tryKind KNumber of
-    Just s -> s
-    Nothing -> mkClosure (regInits "") perIterBindsAny (genStmts ctx body)
+selfLoopClosure :: Env -> String -> TcoRef -> NonEmptyArray (Tuple (Maybe Ident) Level) -> TcoExpr -> String
+selfLoopClosure env tag ref params body =
+  let
+    { copies, block } = selfLoop env tag ref params body
+    lastI = Array.length copies - 1
+    innermost = "func(" <> fromMaybe "_" (Array.index copies lastI) <> " any) any {\n" <> block <> "\n}"
+  in
+    Array.foldr (\c acc -> "func(" <> c <> " any) any { return " <> acc <> " }") innermost
+      (Array.take lastI copies)
+
+-- | The loop of one self-recursive function, as the parameter names it reads
+-- | its first arguments from and the statements that loop. The closure above
+-- | curries it; a saturated entry point (ADR-0009) takes the parameters at once.
+selfLoop :: Env -> String -> TcoRef -> NonEmptyArray (Tuple (Maybe Ident) Level) -> TcoExpr -> { copies :: Array String, block :: String }
+selfLoop env tag ref params body =
+  { copies: Array.mapWithIndex (\i _ -> copyName i) ps
+  , block: case tryKind KInt <|> tryKind KNumber of
+      Just s -> s
+      Nothing -> mkBlock (regInits "") perIterBindsAny (genStmts env ctx body)
+  }
   where
   ps = NEA.toArray params
   arity = Array.length ps
@@ -242,8 +361,8 @@ selfLoopClosure tag ref params body =
   ctx = { members: [ { ref, arity } ], regs, branchReg: Nothing }
   typedSet = Set.fromFoldable (map perIter ps)
 
-  tryKind k = mkClosure (regInits (".(" <> kindType k <> ")")) (perIterBindsTyped k)
-    <$> genStmtsNumeric k ctx typedSet body
+  tryKind k = mkBlock (regInits (".(" <> kindType k <> ")")) (perIterBindsTyped k)
+    <$> genStmtsNumeric env k ctx typedSet body
 
   -- registers: `_rN := _cN<assert>` (assert is "" for the all-`any` fallback)
   regInits assert = Array.mapWithIndex (\i _ -> regName i <> " := " <> copyName i <> assert) ps
@@ -252,14 +371,8 @@ selfLoopClosure tag ref params body =
   perIterBindsTyped k = Array.mapWithIndex
     (\i p -> "var " <> perIter p <> " " <> kindType k <> " = " <> regName i <> "\n_ = " <> perIter p) ps
 
-  lastI = arity - 1
-  outerIdxs = if arity <= 1 then [] else Array.range 0 (arity - 2)
-  mkClosure inits binds bodyStmts =
-    let
-      loopBlock = String.joinWith "\n" (inits <> [ "for {" ] <> binds <> [ bodyStmts, "}" ])
-      innermost = "func(" <> copyName lastI <> " any) any {\n" <> loopBlock <> "\n}"
-    in
-      Array.foldr (\i acc -> "func(" <> copyName i <> " any) any { return " <> acc <> " }") innermost outerIdxs
+  mkBlock inits binds bodyStmts =
+    String.joinWith "\n" (inits <> [ "for {" ] <> binds <> [ bodyStmts, "}" ])
 
 -- | A primitive loop-register kind we can keep native (unboxed). Mixed-kind loops
 -- | aren't handled (they need per-register typing across the calling convention).
@@ -278,10 +391,12 @@ guardKind want k = if want == k then Just unit else Nothing
 -- | Emit an expression as a native value of `k` (Go `int`/`float64`), or `Nothing`
 -- | if it is not statically `k`-typed (a `k` PrimOp, `k` literal, or a known
 -- | native-`k` loop local).
-genNumeric :: NumKind -> Set String -> TcoExpr -> Maybe String
-genNumeric k typed (TcoExpr _ syn) = case syn of
+genNumeric :: Env -> NumKind -> Set String -> TcoExpr -> Maybe String
+genNumeric env k typed (TcoExpr _ syn) = case syn of
   Lit (LitInt n) -> guardKind KInt k $> show n
-  Lit (LitNumber n) | Number.isFinite n -> guardKind KNumber k $> show n
+  Lit (LitNumber n)
+    | isNegZero n -> guardKind KNumber k $> "_negZero.(float64)"
+    | Number.isFinite n -> guardKind KNumber k $> show n
   Local mbId lvl | Set.member (localName mbId lvl) typed -> Just (localName mbId lvl)
   PrimOp (Op1 OpIntNegate a) -> guardKind KInt k *> neg a
   PrimOp (Op1 OpNumberNegate a) -> guardKind KNumber k *> neg a
@@ -289,14 +404,14 @@ genNumeric k typed (TcoExpr _ syn) = case syn of
   PrimOp (Op2 (OpNumberNum op) a b) -> guardKind KNumber k *> numBin op a b
   _ -> Nothing
   where
-  neg a = (\s -> "(-" <> s <> ")") <$> genNumeric k typed a
-  bin o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genNumeric k typed a <*> genNumeric k typed b
+  neg a = (\s -> "(-" <> s <> ")") <$> genNumeric env k typed a
+  bin o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genNumeric env k typed a <*> genNumeric env k typed b
   intBin op a b = case op of
     OpAdd -> bin "+" a b
     OpSubtract -> bin "-" a b
     OpMultiply -> bin "*" a b
     -- PS int div-by-zero returns 0; native `/` panics. Route through _intDivI.
-    OpDivide -> (\x y -> "_intDivI(" <> x <> ", " <> y <> ")") <$> genNumeric k typed a <*> genNumeric k typed b
+    OpDivide -> (\x y -> "_intDivI(" <> x <> ", " <> y <> ")") <$> genNumeric env k typed a <*> genNumeric env k typed b
   numBin op a b = case op of
     OpAdd -> bin "+" a b
     OpSubtract -> bin "-" a b
@@ -305,17 +420,17 @@ genNumeric k typed (TcoExpr _ syn) = case syn of
 
 -- | Emit a boolean condition natively (`k` comparisons + boolean connectives over
 -- | them), or `Nothing`.
-genBoolNumeric :: NumKind -> Set String -> TcoExpr -> Maybe String
-genBoolNumeric k typed (TcoExpr _ syn) = case syn of
+genBoolNumeric :: Env -> NumKind -> Set String -> TcoExpr -> Maybe String
+genBoolNumeric env k typed (TcoExpr _ syn) = case syn of
   PrimOp (Op2 (OpIntOrd op) a b) -> guardKind KInt k *> cmp op a b
   PrimOp (Op2 (OpNumberOrd op) a b) -> guardKind KNumber k *> cmp op a b
   PrimOp (Op2 OpBooleanAnd a b) -> conn "&&" a b
   PrimOp (Op2 OpBooleanOr a b) -> conn "||" a b
-  PrimOp (Op1 OpBooleanNot a) -> (\s -> "(!" <> s <> ")") <$> genBoolNumeric k typed a
+  PrimOp (Op1 OpBooleanNot a) -> (\s -> "(!" <> s <> ")") <$> genBoolNumeric env k typed a
   _ -> Nothing
   where
-  cmp op a b = (\x y -> "(" <> x <> " " <> ordOp op <> " " <> y <> ")") <$> genNumeric k typed a <*> genNumeric k typed b
-  conn o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genBoolNumeric k typed a <*> genBoolNumeric k typed b
+  cmp op a b = (\x y -> "(" <> x <> " " <> ordOp op <> " " <> y <> ")") <$> genNumeric env k typed a <*> genNumeric env k typed b
+  conn o a b = (\x y -> "(" <> x <> " " <> o <> " " <> y <> ")") <$> genBoolNumeric env k typed a <*> genBoolNumeric env k typed b
   ordOp = case _ of
     OpEq -> "=="
     OpNotEq -> "!="
@@ -327,28 +442,28 @@ genBoolNumeric k typed (TcoExpr _ syn) = case syn of
 -- | Statement-mode walk of a `k`-pure loop body: native arithmetic throughout,
 -- | box only at the leaf `return`. Returns `Nothing` (→ caller falls back to the
 -- | all-`any` loop, or tries the next kind) if any node is not `k`-typed.
-genStmtsNumeric :: NumKind -> LoopCtx -> Set String -> TcoExpr -> Maybe String
-genStmtsNumeric k ctx typed te@(TcoExpr _ syn) = case syn of
+genStmtsNumeric :: Env -> NumKind -> LoopCtx -> Set String -> TcoExpr -> Maybe String
+genStmtsNumeric env k ctx typed te@(TcoExpr _ syn) = case syn of
   Branch pairs def -> do
     parts <- traverse
       ( \(Pair cond b) -> do
-          c <- genBoolNumeric k typed cond
-          bb <- genStmtsNumeric k ctx typed b
+          c <- genBoolNumeric env k typed cond
+          bb <- genStmtsNumeric env k ctx typed b
           pure ("if " <> c <> " {\n" <> bb <> "\n}")
       )
       (NEA.toArray pairs)
-    d <- genStmtsNumeric k ctx typed def
+    d <- genStmtsNumeric env k ctx typed def
     pure (String.joinWith "\n" parts <> "\n" <> d)
 
   Let mbId lvl val rest -> do
-    v <- genNumeric k typed val
+    v <- genNumeric env k typed val
     let nm = localName mbId lvl
-    rest' <- genStmtsNumeric k ctx (Set.insert nm typed) rest
+    rest' <- genStmtsNumeric env k ctx (Set.insert nm typed) rest
     pure ("var " <> nm <> " " <> kindType k <> " = " <> v <> "\n_ = " <> nm <> "\n" <> rest')
 
   App (TcoExpr _ hsyn) args
     | Just idx <- findMember ctx hsyn (NEA.length args) -> do
-        argStrs <- traverse (genNumeric k typed) (NEA.toArray args)
+        argStrs <- traverse (genNumeric env k typed) (NEA.toArray args)
         let
           brLine = case ctx.branchReg of
             Just br -> [ br <> " = " <> show idx ]
@@ -358,7 +473,7 @@ genStmtsNumeric k ctx typed te@(TcoExpr _ syn) = case syn of
         pure (String.joinWith "\n" (brLine <> regLines) <> "\ncontinue")
 
   _ -> do
-    e <- genNumeric k typed te
+    e <- genNumeric env k typed te
     pure ("return any(" <> e <> ")")
 
 -- | A curried lambda `func(p0) any { return func(p1) any { return body } }`.
@@ -370,18 +485,18 @@ curriedReturn params body =
 -- | A tail call to a group member becomes branch+register reassignment +
 -- | `continue`; every other tail position becomes `return <expr>` (evaluated by
 -- | the expression walker). Branch/Let preserve tail position into sub-bodies.
-genStmts :: LoopCtx -> TcoExpr -> String
-genStmts ctx te@(TcoExpr _ syn) = case syn of
+genStmts :: Env -> LoopCtx -> TcoExpr -> String
+genStmts env ctx te@(TcoExpr _ syn) = case syn of
   Branch pairs def ->
     String.joinWith "\n"
-      ( map (\(Pair cond b) -> "if _truthy(" <> genExpr cond <> ") {\n" <> genStmts ctx b <> "\n}")
+      ( map (\(Pair cond b) -> "if _truthy(" <> genExpr env cond <> ") {\n" <> genStmts env ctx b <> "\n}")
           (NEA.toArray pairs)
       )
-      <> "\n" <> genStmts ctx def
+      <> "\n" <> genStmts env ctx def
 
   Let mbId lvl val rest ->
     let nm = localName mbId lvl
-    in "var " <> nm <> " any = " <> genExpr val <> "\n_ = " <> nm <> "\n" <> genStmts ctx rest
+    in "var " <> nm <> " any = " <> genExpr env val <> "\n_ = " <> nm <> "\n" <> genStmts env ctx rest
 
   App (TcoExpr _ hsyn) args
     | Just idx <- findMember ctx hsyn (NEA.length args) ->
@@ -390,11 +505,11 @@ genStmts ctx te@(TcoExpr _ syn) = case syn of
             Just br -> [ br <> " = " <> show idx ]
             Nothing -> []
           regLines = Array.mapWithIndex
-            (\i a -> fromMaybe "_" (Array.index ctx.regs i) <> " = " <> genExpr a)
+            (\i a -> fromMaybe "_" (Array.index ctx.regs i) <> " = " <> genExpr env a)
             (NEA.toArray args)
         in String.joinWith "\n" (brLine <> regLines) <> "\ncontinue"
 
-  _ -> "return " <> genExpr te
+  _ -> "return " <> genExpr env te
 
 -- | Index of the loop member an application head refers to, if its arity matches.
 findMember :: LoopCtx -> BackendSyntax TcoExpr -> Int -> Maybe Int
@@ -473,25 +588,36 @@ localName mbIdent (Level n) = case mbIdent of
 -- Expressions
 --------------------------------------------------------------------------------
 
-genExpr :: TcoExpr -> String
-genExpr (TcoExpr ann syn) = case syn of
+genExpr :: Env -> TcoExpr -> String
+genExpr env (TcoExpr ann syn) = case syn of
   -- Top-level references are forced (every top-level binding is a lazy thunk).
   Var (Qualified (Just mn) ident) -> "_force(" <> topName mn ident <> ")"
   Var (Qualified Nothing ident) -> "_force(" <> goIdent ident <> ")"
 
   Local mbIdent lvl -> localName mbIdent lvl
 
-  Lit lit -> genLit lit
+  Lit lit -> genLit env lit
+
+  -- A saturated call of a known top-level function (ADR-0009): its Go func
+  -- takes the first n arguments at once, and any extra are applied curried.
+  App (TcoExpr _ (Var q@(Qualified (Just mn) ident))) args
+    | Just n <- Map.lookup q env.arities
+    , NEA.length args >= n ->
+        let
+          as = NEA.toArray args
+          call = satName (topName mn ident) <> "(" <> commaSep (map (genExpr env) (Array.take n as)) <> ")"
+        in
+          Array.foldl (\acc a -> curriedApp acc (genExpr env a)) call (Array.drop n as)
 
   -- Curried desugaring (slice): App f [a1..an] -> f(a1)(a2)..(an).
   App f args ->
-    Array.foldl (\acc a -> curriedApp acc (genExpr a)) (genExpr f) (NEA.toArray args)
+    Array.foldl (\acc a -> curriedApp acc (genExpr env a)) (genExpr env f) (NEA.toArray args)
 
   -- Curried desugaring (slice): Abs [p1..pn] body -> nested unary closures.
   -- Each level returns the next closure; the innermost returns the body.
   Abs params body ->
     Array.foldr (\(Tuple mbI lvl) acc -> closure (localName mbI lvl) ("return " <> acc))
-      (genExpr body)
+      (genExpr env body)
       (NEA.toArray params)
 
   -- Uncurried FFI (Fn/EffectFn): real Go multi-arg funcs via variadic
@@ -500,25 +626,25 @@ genExpr (TcoExpr ann syn) = case syn of
   -- call, so its body is forced and the call site is wrapped in a thunk for
   -- uniform _runEffect.
   UncurriedAbs params body ->
-    uncurriedFn (Array.fromFoldable params) (genExpr body)
+    uncurriedFn (Array.fromFoldable params) (genExpr env body)
   UncurriedApp f args ->
-    "(" <> genExpr f <> ").(func(...any) any)(" <> commaSep (map genExpr args) <> ")"
+    "(" <> genExpr env f <> ").(func(...any) any)(" <> commaSep (map (genExpr env) args) <> ")"
   UncurriedEffectAbs params body ->
-    uncurriedFn (Array.fromFoldable params) ("_runEffect(" <> genExpr body <> ")")
+    uncurriedFn (Array.fromFoldable params) ("_runEffect(" <> genExpr env body <> ")")
   UncurriedEffectApp f args ->
-    "func() any { return (" <> genExpr f <> ").(func(...any) any)(" <> commaSep (map genExpr args) <> ") }"
+    "func() any { return (" <> genExpr env f <> ").(func(...any) any)(" <> commaSep (map (genExpr env) args) <> ") }"
 
-  Accessor a acc -> genAccessor (genExpr a) acc
+  Accessor a acc -> genAccessor (genExpr env a) acc
 
   -- Immutable record update: copy the base map, overwrite the given fields.
   Update base props ->
-    "_recordUpdate(" <> genExpr base <> ", map[string]any{" <> commaSep (map genProp props) <> "})"
+    "_recordUpdate(" <> genExpr env base <> ", map[string]any{" <> commaSep (map genProp props) <> "})"
     where
-    genProp (Prop k v) = goStr k <> ": " <> genExpr v
+    genProp (Prop k v) = goStr k <> ": " <> genExpr env v
 
   -- Fully-applied data constructor: V{Tag, Fields}.
   CtorSaturated _ _ _ (Ident tag) fields ->
-    "V{Tag: " <> goStr tag <> ", Fields: []any{" <> commaSep (map (genExpr <<< snd') fields) <> "}}"
+    "V{Tag: " <> goStr tag <> ", Fields: []any{" <> commaSep (map (genExpr env <<< snd') fields) <> "}}"
 
   -- A constructor's curried builder function.
   CtorDef _ _ (Ident tag) fieldNames ->
@@ -531,7 +657,7 @@ genExpr (TcoExpr ann syn) = case syn of
     | isLoopAnalysis ann
     , Just members <- traverse loopBindingOf bindings ->
         let
-          pairs = loopBindings (\ident -> localName (Just ident) lvl)
+          pairs = loopBindings env (\ident -> localName (Just ident) lvl)
             (\ident -> TcoLocal (Just ident) lvl) identity members
         in
           -- declare all names first, THEN assign: a local mutual loop's internal
@@ -541,7 +667,7 @@ genExpr (TcoExpr ann syn) = case syn of
             ( map (\(Tuple nm _) -> "var " <> nm <> " any") pairs
                 <> map (\(Tuple nm expr) -> nm <> " = " <> expr) pairs
                 <> map (\(Tuple nm _) -> "_ = " <> nm) pairs
-                <> [ "return " <> genExpr body ]
+                <> [ "return " <> genExpr env body ]
             )
 
   -- Non-loop recursive let group: declare all names, then assign (Go closures
@@ -554,39 +680,39 @@ genExpr (TcoExpr ann syn) = case syn of
     in
       iife
         ( map (\(Tuple ident _) -> "var " <> nm ident <> " any") binds
-            <> map (\(Tuple ident e) -> nm ident <> " = " <> genExpr e) binds
+            <> map (\(Tuple ident e) -> nm ident <> " = " <> genExpr env e) binds
             <> map (\(Tuple ident _) -> "_ = " <> nm ident) binds
-            <> [ "return " <> genExpr body ]
+            <> [ "return " <> genExpr env body ]
         )
 
   Let mbIdent lvl val body ->
     let nm = localName mbIdent lvl in
     iife
-      [ "var " <> nm <> " any = " <> genExpr val
+      [ "var " <> nm <> " any = " <> genExpr env val
       , "_ = " <> nm  -- the optimizer may bind a value the body ignores; Go errors on unused locals
-      , "return " <> genExpr body
+      , "return " <> genExpr env body
       ]
 
   EffectBind mbIdent lvl val body ->
     -- Effect a == func() any. Bind sequences thunks; whole thing is a thunk.
     let nm = localName mbIdent lvl in
     "func() any {\n" <>
-      "var " <> nm <> " any = _runEffect(" <> genExpr val <> ")\n" <>
+      "var " <> nm <> " any = _runEffect(" <> genExpr env val <> ")\n" <>
       "_ = " <> nm <> "\n" <>
-      "return _runEffect(" <> genExpr body <> ")\n" <>
+      "return _runEffect(" <> genExpr env body <> ")\n" <>
     "}"
 
-  EffectPure a -> "func() any { return " <> genExpr a <> " }"
-  EffectDefer a -> genExpr a
+  EffectPure a -> "func() any { return " <> genExpr env a <> " }"
+  EffectDefer a -> genExpr env a
 
   Branch pairs default_ ->
-    iife (map genPair (NEA.toArray pairs) <> [ "return " <> genExpr default_ ])
+    iife (map genPair (NEA.toArray pairs) <> [ "return " <> genExpr env default_ ])
     where
     genPair (Pair cond body) =
-      "if _truthy(" <> genExpr cond <> ") { return " <> genExpr body <> " }"
+      "if _truthy(" <> genExpr env cond <> ") { return " <> genExpr env body <> " }"
 
-  PrimOp op -> genOp op
-  PrimEffect eff -> genPrimEffect eff
+  PrimOp op -> genOp env op
+  PrimEffect eff -> genPrimEffect env eff
   PrimUndefined -> "nil"
   Fail msg -> "_fail(" <> goStr msg <> ")"
   where
@@ -596,24 +722,30 @@ genExpr (TcoExpr ann syn) = case syn of
 -- Literals, accessors, constructors, operators, effects
 --------------------------------------------------------------------------------
 
-genLit :: Literal TcoExpr -> String
-genLit = case _ of
+genLit :: Env -> Literal TcoExpr -> String
+genLit env = case _ of
   LitInt n -> show n
   -- PureScript `show :: Number -> String` renders non-finite values as the
   -- bare tokens Infinity/-Infinity/NaN, which aren't valid Go float syntax.
   -- Non-finite literals reference runtime.go package vars (generated module
   -- files carry no imports; runtime.go owns the `math` import).
+  -- Negative zero likewise: the optimizer folds `negate 0.0` to the literal
+  -- -0.0, and a Go constant -0.0 is +0.0, so it reads a runtime var too.
   LitNumber n
     | Number.isNaN n -> "_nan"
     | not (Number.isFinite n) -> if n < 0.0 then "_negInf" else "_posInf"
+    | isNegZero n -> "_negZero"
     | otherwise -> show n
   LitString s -> goStr s
   LitChar c -> goStr (SCU.singleton c)
   LitBoolean b -> if b then "true" else "false"
-  LitArray as -> "[]any{" <> commaSep (map genExpr as) <> "}"
+  LitArray as -> "[]any{" <> commaSep (map (genExpr env) as) <> "}"
   LitRecord props -> "map[string]any{" <> commaSep (map genProp props) <> "}"
   where
-  genProp (Prop k v) = goStr k <> ": " <> genExpr v
+  genProp (Prop k v) = goStr k <> ": " <> genExpr env v
+
+isNegZero :: Number -> Boolean
+isNegZero n = n == 0.0 && 1.0 / n < 0.0
 
 genAccessor :: String -> BackendAccessor -> String
 genAccessor base = case _ of
@@ -621,10 +753,10 @@ genAccessor base = case _ of
   GetIndex i -> "(" <> base <> ").([]any)[" <> show i <> "]"
   GetCtorField _ _ _ _ _ idx -> "(" <> base <> ").(V).Fields[" <> show idx <> "]"
 
-genOp :: BackendOperator TcoExpr -> String
-genOp = case _ of
-  Op1 op a -> genOp1 op (genExpr a)
-  Op2 op a b -> genOp2 op (genExpr a) (genExpr b)
+genOp :: Env -> BackendOperator TcoExpr -> String
+genOp env = case _ of
+  Op1 op a -> genOp1 op (genExpr env a)
+  Op2 op a b -> genOp2 op (genExpr env a) (genExpr env b)
 
 -- All operators lower to `any`-taking runtime helpers (defined in runtime.go)
 -- that perform their type assertions INTERNALLY. This keeps codegen uniform
@@ -687,11 +819,11 @@ call1 fn a = fn <> "(" <> a <> ")"
 call2 :: String -> String -> String -> String
 call2 fn a b = fn <> "(" <> a <> ", " <> b <> ")"
 
-genPrimEffect :: BackendEffect TcoExpr -> String
-genPrimEffect = case _ of
-  EffectRefNew a -> "func() any { return _refNew(" <> genExpr a <> ") }"
-  EffectRefRead a -> "func() any { return _refRead(" <> genExpr a <> ") }"
-  EffectRefWrite a b -> "func() any { return _refWrite(" <> genExpr a <> ", " <> genExpr b <> ") }"
+genPrimEffect :: Env -> BackendEffect TcoExpr -> String
+genPrimEffect env = case _ of
+  EffectRefNew a -> "func() any { return _refNew(" <> genExpr env a <> ") }"
+  EffectRefRead a -> "func() any { return _refRead(" <> genExpr env a <> ") }"
+  EffectRefWrite a b -> "func() any { return _refWrite(" <> genExpr env a <> ", " <> genExpr env b <> ") }"
 
 --------------------------------------------------------------------------------
 -- Go emission helpers

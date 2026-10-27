@@ -25,14 +25,27 @@
 -- Constructor. Self tail calls compile to a @for {}@ loop (ADR 0003; see
 -- "Self tail calls" below); the Unused pass is ADR 0008.
 --
+-- Saturated calls and the inliner (ADR 0009; see "Saturated calls" below):
+-- a top-level binding that is an n-deep lambda chain also gets a plain Go
+-- func of n parameters, and a call that supplies at least n arguments calls
+-- it directly. The curried closure stays, and is what escapes into
+-- first-class use. Then purs's JS inliner set: runFnN/mkFnN and their
+-- Effect/ST forms, primitive ops through a known dictionary, saturated
+-- constructors.
+--
 module Language.PureScript.Go.CodeGen
   ( generateModule
+  , Known
+  , knownBindings
   ) where
 
 import Prelude
 
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Text.Read (readMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -44,9 +57,60 @@ import Language.PureScript.Go.CodeGen.AST
 import Language.PureScript.Go.CodeGen.Common
 import qualified Language.PureScript.Go.CodeGen.Pretty as Pretty
 
+-- | What the whole program knows about one top-level binding (ADR 0009).
+data KnownDef
+  = KnownFn Int            -- ^ a lambda chain this many parameters deep
+  | KnownCtor CtorShape    -- ^ a constructor
+  -- | A top-level name applied to top-level names, such as the
+  -- @negate = Data.Ring.negate ringNumber@ that CoreFn floats out of every
+  -- use of a dictionary method. purs's inliner looks through these (its
+  -- "expander"), and so do we.
+  | KnownAlias P.ModuleName P.Ident [CoreFn.Expr CoreFn.Ann]
+
+data CtorShape
+  = CtorNewtype            -- ^ erased: the constructor is the identity
+  | CtorDict [P.Ident]     -- ^ a type-class dictionary: a map of its fields
+  | CtorData Text Int      -- ^ a data constructor: tag and field count
+
+-- | Every emitted top-level binding whose shape is known, keyed by module.
+type Known = Map (P.ModuleName, P.Ident) KnownDef
+
+-- | The arity map: one fold over every emitted module's declarations, so a
+-- call in one module is saturated against a definition in another. Foreigns
+-- are not declarations, so they never appear and stay curried.
+knownBindings :: [CoreFn.Module CoreFn.Ann] -> Known
+knownBindings mods = Map.fromList
+  [ ((CoreFn.moduleName m, ident), k)
+  | m <- mods
+  , bind <- CoreFn.moduleDecls m
+  , (ident, expr) <- case bind of
+      CoreFn.NonRec _ i e -> [(i, e)]
+      CoreFn.Rec bs -> [ (i, e) | ((_, i), e) <- bs ]
+  , Just k <- [knownDef expr] ]
+  where
+    knownDef = \case
+      CoreFn.Constructor ann _ (P.ProperName ctor) fields -> Just . KnownCtor $ case ann of
+        (_, _, Just CoreFn.IsNewtype) -> CtorNewtype
+        (_, _, Just CoreFn.IsTypeClassConstructor) -> CtorDict fields
+        _ -> CtorData (escapeGoString ctor) (length fields)
+      expr@(CoreFn.App {})
+        | (CoreFn.Var _ (P.Qualified (P.ByModuleName mn) i), args) <- unApp expr
+        , all isTopVar args -> Just (KnownAlias mn i args)
+      expr -> case length (fst (peelAbs expr)) of
+        0 -> Nothing
+        n -> Just (KnownFn n)
+    isTopVar = \case
+      CoreFn.Var _ (P.Qualified (P.ByModuleName _) _) -> True
+      _ -> False
+
+-- | The Go func behind a saturated call of the top-level binding @name@.
+-- Generated top-level names start with a module name, so never with @_@.
+satName :: Text -> Text
+satName name = "_sat_" <> name
+
 -- | Generate the top-level Go declarations for one module.
-generateModule :: CoreFn.Module CoreFn.Ann -> [GoDecl]
-generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
+generateModule :: Known -> CoreFn.Module CoreFn.Ann -> [GoDecl]
+generateModule known cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
   where
     currentModule :: P.ModuleName
     currentModule = CoreFn.moduleName cfModule
@@ -60,11 +124,30 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
     -- binding that calls ITSELF in tail position becomes a loop (genRecBind);
     -- mutual tail calls between bindings of one group stay ordinary calls.
     generateBind :: CoreFn.Bind CoreFn.Ann -> [GoDecl]
-    generateBind (CoreFn.NonRec _ ident expr) =
-      [ GoVarDecl (goTopName currentModule ident) (genExpr expr) ]
+    generateBind (CoreFn.NonRec _ ident expr) = topBind False ident expr
     generateBind (CoreFn.Rec bindings) =
-      [ GoVarDecl (goTopName currentModule ident) (genRecBind (topSelf ident) ident expr)
-      | ((_, ident), expr) <- bindings ]
+      concat [ topBind True ident expr | ((_, ident), expr) <- bindings ]
+
+    -- A known-arity function (ADR 0009) is two declarations: the plain Go
+    -- func that saturated calls reach, and the curried closure, now a thin
+    -- wrapper over it, for first-class use. A self-tail-recursive binding
+    -- loops inside the func.
+    topBind :: Bool -> P.Ident -> CoreFn.Expr CoreFn.Ann -> [GoDecl]
+    topBind recursive ident expr = case Map.lookup (currentModule, ident) known of
+      Just (KnownFn n) ->
+        let (params, body) = peelAbs expr
+            isSelf = topSelf ident
+            stmts = case if recursive then tryTco isSelf ident expr else Nothing of
+              Just (ps, b) -> tcoStmts isSelf ps b
+              Nothing -> [ GoReturn (genExpr body) ]
+            args = [ "_a" <> tshow i | i <- [0 .. n - 1] ]
+            wrapper = foldr (\a acc -> GoClosure a [ GoReturn acc ])
+                            (GoCall (GoVar (satName name)) (map GoVar args)) args
+        in [ GoFuncDecl (satName name) (funcParams params) stmts
+           , GoVarDecl name wrapper ]
+      _ -> [ GoVarDecl name (if recursive then genRecBind (topSelf ident) ident expr
+                                          else genExpr expr) ]
+      where name = goTopName currentModule ident
 
     -- A reference to the top-level binding @ident@ of this module.
     topSelf :: P.Ident -> SelfRef
@@ -121,6 +204,14 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
     genTco :: SelfRef -> [P.Ident] -> CoreFn.Expr CoreFn.Ann -> GoExpr
     genTco isSelf params body =
       let names = map identToGoName params
+          innermost = GoClosure (last names) (tcoStmts isSelf params body)
+      in foldr (\nm acc -> GoClosure nm [ GoReturn acc ]) innermost (init names)
+
+    -- | The loop itself, as the body of the innermost closure or of a
+    -- saturated func: copy the parameters into loop state, then loop.
+    tcoStmts :: SelfRef -> [P.Ident] -> CoreFn.Expr CoreFn.Ann -> [GoStmt]
+    tcoStmts isSelf params body =
+      let names = map identToGoName params
           used = usedIdents body
           -- A param the body can see: used, and not hidden by a later param
           -- of the same name (only the last of duplicates is in scope).
@@ -134,8 +225,7 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
           copies = concat [ [ GoAssign nm (GoVar (st i)), GoSet ["_"] [GoVar nm] ]
                           | (i, nm) <- liveIx ]
           loopBody = copies ++ tailStmts isSelf live body
-          innermost = GoClosure (last names) (inits ++ [ GoFor loopBody ])
-      in foldr (\nm acc -> GoClosure nm [ GoReturn acc ]) innermost (init names)
+      in inits ++ [ GoFor loopBody ]
 
     -- | An expression in tail position of a TCO loop, as statements. Every
     -- path ends in @continue@ (self call), @return@, or a pattern-match panic.
@@ -174,8 +264,7 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
       CoreFn.Abs _ arg body ->
         GoClosure (identToGoName arg) [ GoReturn (genExpr body) ]
 
-      CoreFn.App _ fn arg ->
-        GoCurriedApp (genExpr fn) (genExpr arg)
+      e@(CoreFn.App {}) -> genApp e
 
       CoreFn.Let _ binds body ->
         GoIIFE (genLetGroup binds body ++ [ GoReturn (genExpr body) ])
@@ -201,6 +290,152 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
 
       CoreFn.Constructor ann _ (P.ProperName ctor) fields ->
         genConstructor ann ctor fields
+
+    -- ---------------------------------------------------------------
+    -- Saturated calls and the inliner (ADR 0009)
+    -- ---------------------------------------------------------------
+    --
+    -- An application spine @f a1 .. ak@ whose head is a top-level name:
+    --
+    --   * an inliner rule for that name (purs's JS CoreImp set, below)
+    --     replaces the call outright;
+    --   * else a known function of arity n <= k is called directly,
+    --     @_sat_f(a1, .., an)@, and the rest applied curried;
+    --   * else a known constructor applied to all its fields is built in
+    --     place.
+    --
+    -- Anything else, an unknown head or too few arguments, is the curried
+    -- application it always was. Arguments are pure expressions, and the
+    -- intermediate closures of a lambda chain do nothing but capture, so
+    -- calling all at once changes no result.
+    genApp :: CoreFn.Expr CoreFn.Ann -> GoExpr
+    genApp e = case unApp e of
+      (CoreFn.Var _ (P.Qualified (P.ByModuleName mn) ident), args)
+        | Just (k, r) <- inlineApp mn ident args <|> saturate mn ident args ->
+            applyRest r (drop k args)
+        -- Through an alias, when that reaches past the alias's own
+        -- arguments into the call's.
+        | Just (KnownAlias amn aident pre) <- Map.lookup (mn, ident) known
+        , let args' = pre ++ args
+        , Just (k, r) <- inlineApp amn aident args' <|> saturate amn aident args'
+        , k > length pre ->
+            applyRest r (drop k args')
+      (hd, args) -> applyRest (genExpr hd) args
+      where
+        applyRest = foldl (\acc a -> GoCurriedApp acc (genExpr a))
+        a <|> b = maybe b Just a
+
+    -- | A call of a known binding with enough arguments: how many it takes,
+    -- and the call.
+    saturate :: P.ModuleName -> P.Ident -> [CoreFn.Expr CoreFn.Ann] -> Maybe (Int, GoExpr)
+    saturate mn ident args = case Map.lookup (mn, ident) known of
+      Just (KnownFn n) | length args >= n ->
+        Just (n, GoCall (GoVar (satName (goTopName mn ident))) (map genExpr (take n args)))
+      Just (KnownCtor CtorNewtype) | (a : _) <- args -> Just (1, genExpr a)
+      Just (KnownCtor (CtorData tag n)) | n > 0, length args >= n ->
+        Just (n, GoADT tag (map genExpr (take n args)))
+      Just (KnownCtor (CtorDict fields)) | not (null fields), length args >= length fields ->
+        Just (length fields, GoMapLit (zip (map runIdent' fields) (map genExpr args)))
+      _ -> Nothing
+
+    -- | purs's JS inliner (CoreImp/Optimizer/Inliner.hs), rule for rule where
+    -- Go can say the same thing. Each primitive op means exactly what the
+    -- prelude.go shim it replaces means, which is what the JS operator means
+    -- except where the ledger already says otherwise (Int is not wrapped to
+    -- 32 bits). The one deliberate change is `negate` on Number: unary minus,
+    -- as JS, so `negate 0.0` is -0.0 and the NEGZERO entries close.
+    inlineApp :: P.ModuleName -> P.Ident -> [CoreFn.Expr CoreFn.Ann] -> Maybe (Int, GoExpr)
+    inlineApp (P.ModuleName mn) (P.Ident fn) args
+      -- Uncurried functions: Fn and EffectFn are variadic Go funcs.
+      | mn == "Data.Function.Uncurried", Just n <- suffix "runFn", n /= 1
+      , (f : rest) <- args, length rest >= n =
+          Just (n + 1, GoTypedCall "func(...any) any" (genExpr f) (map genExpr (take n rest)))
+      | mn == "Data.Function.Uncurried", Just n <- suffix "mkFn", n /= 1
+      , (f : _) <- args, Just body <- uncurried n f (\b -> [ GoReturn (genExpr b) ]) =
+          Just (1, body)
+      | mn `elem` ["Effect.Uncurried", "Control.Monad.ST.Uncurried"]
+      , Just n <- suffix "runEffectFn" <|> suffix "runSTFn", n >= 1
+      , (f : rest) <- args, length rest >= n =
+          Just (n + 1, GoThunk [ GoReturn (GoTypedCall "func(...any) any" (genExpr f)
+                                                         (map genExpr (take n rest))) ])
+      | mn `elem` ["Effect.Uncurried", "Control.Monad.ST.Uncurried"]
+      , Just n <- suffix "mkEffectFn" <|> suffix "mkSTFn", n >= 1
+      , (f : _) <- args
+      , Just body <- uncurried n f (\b -> [ GoReturn (GoTypedCall "func() any" (genExpr b) []) ]) =
+          Just (1, body)
+      -- Primitive ops through a known dictionary.
+      | (CoreFn.Var _ (P.Qualified (P.ByModuleName (P.ModuleName dm)) (P.Ident dict)) : rest) <- args
+      , Just op <- lookup (mn, fn, dm, dict) dictOps =
+          case (op, rest) of
+            (OpBinary t r o, x : y : _) -> Just (3, binaryOp t r o x y)
+            (OpUnary t o, x : _) -> Just (2, unaryOp t o x)
+            (OpValue v, _) -> Just (1, v)
+            _ -> Nothing
+      | mn == "Data.Int.Bits", Just o <- lookup fn bitOps, x : y : _ <- args =
+          Just (2, bitOp o (genExpr x) (genExpr y))
+      | mn == "Data.Int.Bits", fn == "complement", x : _ <- args =
+          Just (1, GoTyped "int" (GoCall (GoVar "_toInt32") [ GoUnary "^" (bitOperand (genExpr x)) ]))
+      | mn == "Data.Array", fn == "unsafeIndex"
+      , CoreFn.Var {} : arr : i : _ <- args =
+          Just (3, GoSliceIndex (boxLit (genExpr arr)) (operand "int" (genExpr i)))
+      | mn == "Unsafe.Coerce", fn == "unsafeCoerce", x : _ <- args = Just (1, genExpr x)
+      | mn == "Control.Category", fn == "identity"
+      , CoreFn.Var _ (P.Qualified (P.ByModuleName (P.ModuleName "Control.Category")) (P.Ident "categoryFn")) : x : _ <- args =
+          Just (2, genExpr x)
+      where
+        suffix pre = T.stripPrefix pre fn >>= readMaybe . T.unpack >>= \n ->
+          if n >= 0 && n <= (10 :: Int) then Just n else Nothing
+        a <|> b = maybe b Just a
+    inlineApp _ _ _ = Nothing
+
+    -- | @mkFnN (\a1 .. aN -> body)@ as a variadic func, when the argument is
+    -- a lambda chain at least N deep (purs's @collectArgs@). @mkFn0@ takes
+    -- the one Unit-typed lambda and binds its parameter to nil.
+    uncurried :: Int -> CoreFn.Expr CoreFn.Ann -> (CoreFn.Expr CoreFn.Ann -> [GoStmt]) -> Maybe GoExpr
+    uncurried n f finish =
+      let (params, _) = peelAbs f
+          take' = max n 1
+          body = dropAbs take' f
+          binds
+            | n == 0 = [ GoVarDef nm GoNil | p <- take 1 params, let nm = identToGoName p ]
+            | otherwise =
+                [ GoAssign nm (GoRaw ("_args[" <> tshow i <> "]"))
+                | (i, p) <- zip [0 :: Int ..] (take n params)
+                , p `notElem` drop (i + 1) (take n params)
+                , let nm = identToGoName p ]
+          keep = [ GoSet ["_"] [GoVar nm] | s <- binds, nm <- boundName s ]
+      in if length params >= take' then Just (GoVariadic (binds ++ keep ++ finish body))
+                                   else Nothing
+      where
+        boundName = \case
+          GoAssign nm _ -> [nm]
+          GoVarDef nm _ -> [nm]
+          _ -> []
+
+    binaryOp :: Text -> Text -> Text -> CoreFn.Expr CoreFn.Ann -> CoreFn.Expr CoreFn.Ann -> GoExpr
+    binaryOp t resultT o x y =
+      let a = operand t (genExpr x)
+          b = operand t (genExpr y)
+          -- Two literals would make a Go CONSTANT expression, computed
+          -- exactly rather than in IEEE arithmetic (0.1 + 0.2 == 0.3), and a
+          -- constant zero divisor is a compile error. Unbox one at run time.
+          (a', b') | isLit a && isLit b = (nonConst t a, b)
+                   | o == "/" && isLit b = (a, nonConst t b)
+                   | otherwise = (a, b)
+      in GoTyped resultT $ case o of
+           -- Go has no ordering on bool; these say what false < true says.
+           "b<"  -> GoBinary "&&" (GoUnary "!" a') b'
+           "b<=" -> GoBinary "||" (GoUnary "!" a') b'
+           "b>"  -> GoBinary "&&" a' (GoUnary "!" b')
+           "b>=" -> GoBinary "||" a' (GoUnary "!" b')
+           _     -> GoBinary o a' b'
+
+    -- A literal operand of negate would be negated as a constant, and a
+    -- constant -0.0 is +0.0 in Go.
+    unaryOp :: Text -> Text -> CoreFn.Expr CoreFn.Ann -> GoExpr
+    unaryOp t o x =
+      let a = operand t (genExpr x)
+      in GoTyped t (GoUnary o (if isLit a then nonConst t a else a))
 
     -- | Constructors.
     genConstructor :: CoreFn.Ann -> Text -> [P.Ident] -> GoExpr
@@ -282,8 +517,11 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
           -- let binding that only fed a dead root goes dead too (test `3388`) —
           -- that is the fixpoint, obtained by agreeing on one liveness rule
           -- instead of iterating.
+          -- `var _vN any`, never `:=`: a literal or a constructor literal
+          -- would otherwise give the root a concrete Go type, and every
+          -- assertion on it (and on a binder copied from it) would fail.
           scrutBindings =
-            [ GoAssign ("_v" <> tshow i) (genExpr e)
+            [ GoVarDef ("_v" <> tshow i) (genExpr e)
             | (i, e) <- zip [0 :: Int ..] scruts
             , rootLive i alts ]
           failStmt = GoPanic ("Pattern match failed in module " <> escapeGoString currentModuleText)
@@ -366,7 +604,10 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
     genLiteral :: CoreFn.Literal (CoreFn.Expr CoreFn.Ann) -> GoExpr
     genLiteral = \case
       CoreFn.NumericLiteral (Left n)  -> GoInt n
-      CoreFn.NumericLiteral (Right n) -> GoFloat n
+      -- A Go constant -0.0 is +0.0, so negative zero is negated at run time.
+      CoreFn.NumericLiteral (Right n)
+        | n == 0 && isNegativeZero n -> GoTyped "float64" (GoUnary "-" (nonConst "float64" (GoFloat 0)))
+        | otherwise -> GoFloat n
       CoreFn.StringLiteral s          -> GoString (psStringToText s)
       CoreFn.CharLiteral c            -> GoString (escapeGoString (T.singleton c))
       CoreFn.BooleanLiteral b         -> GoBool b
@@ -387,6 +628,112 @@ generateModule cfModule = concatMap generateBind (CoreFn.moduleDecls cfModule)
 
 -- | Does a variable reference mean the binding being compiled?
 type SelfRef = P.Qualified P.Ident -> Bool
+
+-- | Parameter names for a saturated func. Go rejects a repeated parameter
+-- name, where a curried chain merely shadows; only the last of duplicates is
+-- visible to the body, so the earlier ones become @_@.
+funcParams :: [P.Ident] -> [Text]
+funcParams params =
+  [ if p `elem` drop (i + 1) params then "_" else identToGoName p
+  | (i, p) <- zip [0 :: Int ..] params ]
+
+dropAbs :: Int -> CoreFn.Expr CoreFn.Ann -> CoreFn.Expr CoreFn.Ann
+dropAbs n (CoreFn.Abs _ _ body) | n > 0 = dropAbs (n - 1) body
+dropAbs _ e = e
+
+-- | One inlined dictionary operation (ADR 0009).
+data DictOp
+  = OpBinary Text Text Text   -- ^ operand Go type, result Go type, operator
+  | OpUnary Text Text         -- ^ operand Go type, operator
+  | OpValue GoExpr            -- ^ a constant (@zero@, @top@, ...)
+
+-- | purs's @inlineCommonOperators@ and @inlineCommonValues@, keyed by
+-- (method module, method, dictionary module, dictionary).
+dictOps :: [((Text, Text, Text, Text), DictOp)]
+dictOps =
+  [ (("Data.Semiring", "add", "Data.Semiring", "semiringInt"), OpBinary "int" "int" "+")
+  , (("Data.Semiring", "mul", "Data.Semiring", "semiringInt"), OpBinary "int" "int" "*")
+  , (("Data.Semiring", "add", "Data.Semiring", "semiringNumber"), OpBinary "float64" "float64" "+")
+  , (("Data.Semiring", "mul", "Data.Semiring", "semiringNumber"), OpBinary "float64" "float64" "*")
+  , (("Data.Semiring", "zero", "Data.Semiring", "semiringInt"), OpValue (GoInt 0))
+  , (("Data.Semiring", "one", "Data.Semiring", "semiringInt"), OpValue (GoInt 1))
+  , (("Data.Semiring", "zero", "Data.Semiring", "semiringNumber"), OpValue (GoFloat 0))
+  , (("Data.Semiring", "one", "Data.Semiring", "semiringNumber"), OpValue (GoFloat 1))
+  , (("Data.Ring", "sub", "Data.Ring", "ringInt"), OpBinary "int" "int" "-")
+  , (("Data.Ring", "sub", "Data.Ring", "ringNumber"), OpBinary "float64" "float64" "-")
+  , (("Data.Ring", "negate", "Data.Ring", "ringInt"), OpUnary "int" "-")
+  , (("Data.Ring", "negate", "Data.Ring", "ringNumber"), OpUnary "float64" "-")
+  , (("Data.EuclideanRing", "div", "Data.EuclideanRing", "euclideanRingNumber"), OpBinary "float64" "float64" "/")
+  , (("Data.Semigroup", "append", "Data.Semigroup", "semigroupString"), OpBinary "string" "string" "+")
+  , (("Data.HeytingAlgebra", "conj", "Data.HeytingAlgebra", "heytingAlgebraBoolean"), OpBinary "bool" "bool" "&&")
+  , (("Data.HeytingAlgebra", "disj", "Data.HeytingAlgebra", "heytingAlgebraBoolean"), OpBinary "bool" "bool" "||")
+  , (("Data.HeytingAlgebra", "not", "Data.HeytingAlgebra", "heytingAlgebraBoolean"), OpUnary "bool" "!")
+  , (("Data.Bounded", "top", "Data.Bounded", "boundedBoolean"), OpValue (GoBool True))
+  , (("Data.Bounded", "bottom", "Data.Bounded", "boundedBoolean"), OpValue (GoBool False))
+  ] ++
+  [ (("Data.Eq", m, "Data.Eq", d), OpBinary t "bool" o)
+  | (d, t) <- [("eqInt", "int"), ("eqNumber", "float64"), ("eqString", "string"), ("eqChar", "string"), ("eqBoolean", "bool")]
+  , (m, o) <- [("eq", "=="), ("notEq", "!=")] ] ++
+  [ (("Data.Ord", m, "Data.Ord", d), OpBinary t "bool" o)
+  | (d, t) <- [("ordInt", "int"), ("ordNumber", "float64"), ("ordString", "string"), ("ordChar", "string")]
+  , (m, o) <- [("lessThan", "<"), ("lessThanOrEq", "<="), ("greaterThan", ">"), ("greaterThanOrEq", ">=")] ] ++
+  [ (("Data.Ord", m, "Data.Ord", "ordBoolean"), OpBinary "bool" "bool" o)
+  | (m, o) <- [("lessThan", "b<"), ("lessThanOrEq", "b<="), ("greaterThan", "b>"), ("greaterThanOrEq", "b>=")] ]
+
+-- | Data.Int.Bits, as the prelude.go shims compute them: int32 results, and
+-- shift counts masked to 5 bits.
+data BitOp = BitAnd | BitOr | BitXor | BitShl | BitShr | BitZshr
+
+bitOps :: [(Text, BitOp)]
+bitOps = [ ("and", BitAnd), ("or", BitOr), ("xor", BitXor)
+         , ("shl", BitShl), ("shr", BitShr), ("zshr", BitZshr) ]
+
+bitOp :: BitOp -> GoExpr -> GoExpr -> GoExpr
+bitOp o x y =
+  let a = bitOperand x
+      b = bitOperand y
+      call f e = GoCall (GoVar f) [e]
+      count = call "uint" (GoBinary "&" b (GoInt 31))
+  in GoTyped "int" $ case o of
+       BitAnd  -> call "_toInt32" (GoBinary "&" a b)
+       BitOr   -> call "_toInt32" (GoBinary "|" a b)
+       BitXor  -> call "_toInt32" (GoBinary "^" a b)
+       BitShl  -> call "int" (call "int32" (GoBinary "<<" (call "uint32" a) count))
+       BitShr  -> call "int" (GoBinary ">>" (call "int32" (call "uint32" a)) count)
+       BitZshr -> call "int" (GoBinary ">>" (call "uint32" a) count)
+
+-- | Bit operands are always unboxed at run time: a constant conversion such
+-- as @uint32(-1)@ is a compile error in Go, not a wrap.
+bitOperand :: GoExpr -> GoExpr
+bitOperand e = case operand "int" e of
+  x | isLit x -> nonConst "int" x
+  x -> x
+
+-- | An operand of an inlined op, unboxed to Go type @t@: an inlined op of
+-- the same type is taken bare, a literal stays a literal, anything else is
+-- asserted out of @any@.
+operand :: Text -> GoExpr -> GoExpr
+operand t = \case
+  GoTyped t' x | t' == t -> x
+  e | isLit e -> e
+  e -> GoAssert t e
+
+-- | A literal unboxed at run time, so it is no longer a Go constant.
+nonConst :: Text -> GoExpr -> GoExpr
+nonConst t e = GoAssert t (GoTyped "" e)
+
+isLit :: GoExpr -> Bool
+isLit = \case
+  GoInt _ -> True
+  GoFloat _ -> True
+  GoString _ -> True
+  GoBool _ -> True
+  _ -> False
+
+-- | An array literal has the concrete type @[]any@, which cannot be asserted.
+boxLit :: GoExpr -> GoExpr
+boxLit e@(GoSliceLit _) = GoTyped "" e
+boxLit e = e
 
 -- | @f a1 .. an@ as @(f, [a1 .. an])@.
 unApp :: CoreFn.Expr CoreFn.Ann -> (CoreFn.Expr CoreFn.Ann, [CoreFn.Expr CoreFn.Ann])
@@ -520,6 +867,7 @@ andAll (c:cs) = Just (foldl (GoBinary "&&") c cs)
 -- @bool@, so assert it. A bare boolean literal is already a Go bool.
 asBool :: GoExpr -> GoExpr
 asBool e@(GoBool _) = e
+asBool (GoTyped "bool" e) = e
 asBool e            = GoRaw (prettyOf e <> ".(bool)")
 
 tshow :: Show a => a -> Text

@@ -49,7 +49,7 @@ import qualified Language.PureScript as P
 import qualified Language.PureScript.CoreFn as CoreFn
 import qualified Language.PureScript.CoreFn.FromJSON as CoreFn
 
-import Language.PureScript.Go.CodeGen (generateModule)
+import Language.PureScript.Go.CodeGen (generateModule, knownBindings)
 import Language.PureScript.Go.CodeGen.Common (goModulePrefix)
 import Language.PureScript.Go.CodeGen.Pretty (prettyProgram)
 import Language.PureScript.Go.Foreigns (preludeFile)
@@ -95,7 +95,8 @@ compile opts = do
         orderedNames = loadOrder userMods mainMod
         emitMods = mapMaybe (`Map.lookup` byName) orderedNames
 
-        decls = concatMap generateModule emitMods
+        -- Saturated calls need every emitted module's arities (ADR 0009).
+        decls = concatMap (generateModule (knownBindings emitMods)) emitMods
         body  = prettyProgram decls
         -- main is a generated binding, so it is a lazy thunk: _force it to the
         -- Effect value (itself a `func() any`), then run that effect.

@@ -6,7 +6,6 @@
   "INT32-WRAP": "JS wraps every Int operation to int32 (`|0`); this backend runs wider integer arithmetic, so the JS values are the OVERFLOWED ones. `topInt`/`bottomInt` are foreign imports copied from JS while the arithmetic underneath is wider; Gate C9 / review X8 settles it.",
   "REM-ZERO": "`Int.rem x 0` is NaN on JS, a value that is not an Int at all. No backend with a real integer type can reproduce it; this one answers 0.",
   "ASTRAL": "JS counts UTF-16 code units; this backend counts codepoints. Identical for BMP text.",
-  "NEGZERO": "`purs`'s JS backend inlines `Data.Ring.negate` to unary minus, so `-0.0` there is a genuine negative zero. A faithful CoreFn lowering computes `0.0 - 0.0`, which IEEE says is positive zero, and the sign of a zero is observable through `1/x`, `atan2`, `min`/`max`, `pow` and float32ToInt32 (hence QuickCheck's perturbGen seed). Closing it means matching the inliner in each codegen (#48).",
   "STACK": "JS captures a stack when an Error is constructed; this runtime has one only once an exception is raised (or, on Go, while panicking). `Maybe` is the honest type.",
   "SURROGATE": "A Go string is UTF-8 and cannot hold a lone surrogate, so one round-trips as U+FFFD. Structural, not a shim choice."
  },
@@ -111,13 +110,6 @@
   },
   {
    "module": "Test.Boundaries",
-   "test": "NEGZERO-num-min-zeros",
-   "cause": "NEGZERO",
-   "js": "-Infinity",
-   "backend": "Infinity"
-  },
-  {
-   "module": "Test.Boundaries",
    "test": "char-astral-length",
    "cause": "ASTRAL",
    "js": "2",
@@ -138,61 +130,11 @@
    "backend": "Nothing"
   },
   {
-   "module": "Test.Boundaries",
-   "test": "num-atan2-zero-negzero",
-   "cause": "NEGZERO",
-   "js": "3.141592653589793",
-   "backend": "0.0"
-  },
-  {
-   "module": "Test.Boundaries",
-   "test": "num-pow-negzero-neg1",
-   "cause": "NEGZERO",
-   "js": "-Infinity",
-   "backend": "Infinity"
-  },
-  {
-   "module": "Test.Boundaries",
-   "test": "num-sign-of-negzero",
-   "cause": "NEGZERO",
-   "js": "-Infinity",
-   "backend": "Infinity",
-   "lanes": {
-    "backend-go": "-Infinity"
-   },
-   "lane_note": "backend-go matches JS: purescript-backend-optimizer inlines negate to unary minus, as purs's JS backend does."
-  },
-  {
-   "module": "Test.Boundaries",
-   "test": "num-sign-of-negzero-plus-negzero",
-   "cause": "NEGZERO",
-   "js": "-Infinity",
-   "backend": "Infinity",
-   "lanes": {
-    "backend-go": "-Infinity"
-   },
-   "lane_note": "backend-go matches JS: purescript-backend-optimizer inlines negate to unary minus, as purs's JS backend does."
-  },
-  {
-   "module": "Test.Boundaries",
-   "test": "num-sign-of-sqrt-negzero",
-   "cause": "NEGZERO",
-   "js": "-Infinity",
-   "backend": "Infinity"
-  },
-  {
    "module": "Test.Exceptions",
    "test": "STACK-present-on-construction",
    "cause": "STACK",
    "js": "true",
    "backend": "false"
-  },
-  {
-   "module": "Test.NullableRandom",
-   "test": "NEGZERO-perturb-neg-zero",
-   "cause": "NEGZERO",
-   "js": "-477666",
-   "backend": "63376"
   },
   {
    "module": "Test.Recursion",
