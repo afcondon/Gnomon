@@ -94,9 +94,8 @@ jobs:
           python-version: "3.x"
 
       - name: Conformance lane
-        # The perf drift gate is calibrated on an M4; see bin/conformance.sh.
-        env:
-          PERF_GATE_DRIFT: "0"
+        # The perf drift gate runs only on a machine with its own baseline
+        # (perf/baselines/); on a runner it reports NOT RUN by itself.
         run: |
           set -o pipefail
           bin/conformance.sh 2>&1 | tee conformance.log
