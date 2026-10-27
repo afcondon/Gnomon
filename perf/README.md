@@ -210,6 +210,78 @@ What the index catches, demonstrated with planted changes:
   1.03–1.05x: ok, and correctly so. The corpus never recurses deep enough
   for TCO to matter (≤1e4), which is G8's other half.
 
+## First calls and start-up, with a tolerance per runtime (2026-10-27)
+
+The speed index is steady state only. Jurist#3 cut the corpus's first calls
+on Julia from 7.3 s to 0.55 s, which is the change a Julia user feels most,
+and no gated number moved. So each run now records two more numbers per
+backend, identically in all three repos (the header of `run_perf.py` has the
+reasoning):
+
+- **first-call index**: the sum of first-call times over every shape and
+  size, divided by the same sum on JS in the same run;
+- **start-up**: ms from spawning the process to its first line of output,
+  the median over rounds, against this machine's baseline in ms. It is not a
+  ratio to JS, because node's ~60 ms start-up moved 30 % between runs under
+  load while Julia's 9.3 s moved under 2 %.
+
+Gnomon's psgo lane now runs a binary built in `build()` rather than `go run`,
+so start-up times the program and not Go's compiler.
+
+### Tolerances
+
+| runtime | first-call index | start-up |
+|---|---|---|
+| Julia | 1.25x | 1.25x |
+| Python | 2.0x | not gated |
+| Go | 1.5x | not gated |
+
+A number that is not gated is still printed on every run, and the line says
+`not gated on <runtime>, recorded only`.
+
+### The noise behind them
+
+Every run of an unchanged tree at `--repeat 3`. The Mac Mini M4 was at load
+10–14 throughout (an smbd copy holding about seven cores); there was no
+quieter window. BlackStar (Intel i5-6267U, 4 cores, Linux) was idle, each
+run starting at a 1-minute load of 0.46–0.49; its runs used julia 1.13.1
+against the Mini's 1.12.6.
+
+| lane | first-call index, Mini | spread | idle BlackStar | spread | start-up, Mini | spread | BlackStar |
+|---|---|---|---|---|---|---|---|
+| jl | 65.1–68.6x js (9 runs) | 1.05 | 56.3–57.7x (4) | 1.03 | 9.25–9.40 s | 1.02 | 21.2 s |
+| backend-jl | 29.6–35.1x | 1.19 | 18.9–19.4x | 1.03 | 278–295 ms | 1.06 | 576–593 ms |
+| py | 14.6–21.3x (7 runs) | 1.46 | 11.1–11.6x | 1.05 | 27–74 ms | 2.74 | 55–56 ms |
+| backend-py | 0.87–1.24x | 1.42 | 0.94–0.98x | 1.05 | 19–38 ms | 2.00 | 30–35 ms |
+| go | 3.20–3.49x (7 runs) | 1.09 | 2.57–2.71x | 1.06 | 3–4 ms | — | 2 ms |
+| backend-go | 0.76–0.82x | 1.08 | 0.59–0.65x | 1.10 | 3–5 ms | — | 2 ms |
+
+Most of the Mini's spread is load: on the idle machine every first-call
+index stays within 1.10x. The tolerances are set for the loaded Mini, the
+machine that gates, so on a quiet machine they are looser than they need to
+be. Julia's started at the speed index's 1.10 and moved to 1.25 after one
+run of an unchanged tree read backend-jl at 0.902x.
+
+Start-up on the Jurist oracle lane is 9.3 s on the Mini: loading and
+compiling the emitted program before any PureScript runs. That is
+seventeen times its first calls and thirty times backend-jl's start-up.
+
+### Replaying Jurist#3
+
+`main` from before Jurist#3 (b62de96, with this `run_perf.py`) against the
+baseline recorded after it, alternating with `main`, `--gate-drift`, at
+the first Julia tolerance of 1.10:
+
+| run | jl first-call index | backend-jl first-call index | steady index | exit |
+|---|---|---|---|---|
+| before #3, 1 | 12.77x MOVED | 15.43x MOVED | ok (0.98x, 1.06x) | 1 |
+| before #3, 2 | 12.95x MOVED | 15.72x MOVED | ok (0.97x, 1.06x) | 1 |
+| main, 1 | 1.02x ok | 0.90x: MOVED at the first tolerance, 1.10; ok at 1.25 | ok | 1 (at 1.10) |
+| main, 2 | 1.03x ok | 1.02x ok | ok | 0 |
+
+The steady index passed the pre-#3 tree both times, and the per-shape drift
+on `fold-list` was report-only. Only the first-call index saw the change.
+
 ## What the first run found (2026-08-01, M4 MBP)
 
 **Gnomon has no compilation signal, and the whole corpus runs in 2.3 s.**
@@ -264,7 +336,7 @@ Jurist's first run; they cost nothing here and the corpus is shared.
 | `src/Bench/Clock.purs` | the one foreign: a monotonic clock, a stdout flush, and the two FFI probes |
 | `src/Bench/Clock.js`, `src/Bench/Clock.go` | its implementations, co-located with the `.purs` |
 | `run_perf.py` | build, run, derive ratios, compare — **per-backend** |
-| `baselines/<host>-<cpu>.json` | one machine's recorded ratios, speed index and checksums |
+| `baselines/<host>-<cpu>.json` | one machine's recorded ratios, speed index, first-call index, start-up and checksums |
 
 `src/Bench/Shapes.purs` and `src/Bench/Main.purs` are byte-identical to the
 copies in `purescript-julia/perf/` and `purescript-python/perf/`; `md5` them
