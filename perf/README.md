@@ -8,7 +8,7 @@ cost yesterday?*
 cd perf
 python3 run_perf.py                    # build, run, check
 python3 run_perf.py --skip-build --echo # re-run, streaming
-python3 run_perf.py --update-baseline   # re-record (say why in the commit)
+python3 run_perf.py --update-baseline   # re-record THIS machine's baseline (say why in the commit)
 ```
 
 ## What it is for
@@ -62,7 +62,8 @@ n=10000:
 | `rel` | steady(shape) / steady(calibration) — cost relative to a plain host loop on the same runtime |
 | `f/s` | first / steady — how much of the first call is compilation |
 
-Machine speed cancels, so the baseline is portable to CI. `f/s` is the
+Machine speed was meant to cancel, making the baseline portable to CI. It
+did not: see "Per-machine baselines" below. `f/s` is the
 type-nesting signal in one number: ~1 on a runtime that does not compile per
 call site, and large — and *staying* large as n grows — exactly where
 specialisation is happening.
@@ -140,6 +141,75 @@ tail really looks like; six samples underestimate it.
 A shape that does not complete is recorded as **DNF** rather than crashing
 the lane — see below for why that is a normal outcome here.
 
+## The speed index, per-machine baselines, and the optimizer lane (2026-10-27)
+
+Three holes, found in the October review (REVIEW-2026-10, X3 c–e; G8):
+
+**A uniform change was invisible.** Every `rel` is divided by the same run's
+`loop-fore`, which the same backend compiled, so a change that slows every
+shape alike cancels out of every ratio. Each backend now also gets a **speed
+index**: the geometric mean, over its gated shapes, of steady(backend) /
+steady(js) for the same shape in the same run. `purs` compiles the JS
+reference and nothing in this repo touches it, so a uniform change moves the
+index by its own size. It is gated at **1.10x either way**.
+
+**The baseline was not portable.** The first green CI run put gated JS ratios
+at 2.17x and 0.38x of the M4 baseline with nothing changed. A baseline now
+belongs to the machine that recorded it: `baselines/<host>-<cpu>.json`. A
+machine with none, which means every CI runner since their host names are
+fresh, prints `NOT RUN — Perf drift gate` and, on Actions, a warning
+annotation. Checksums gate everywhere. The MBP's old `baseline.json` is
+gone. Its host was never recorded, so it could not be matched to a machine;
+record one there with `--update-baseline`.
+
+**backend-go had no performance guard at all** (G8), though it owns the TCO
+and unboxing work. The canary now runs it as a third lane, emitted through
+the optimizer as backend-go's conformance lane does, when
+`../purescript-backend-optimizer` is checked out, and says NOT RUN when it
+is not.
+
+Each run takes the median of 3 interleaved rounds (`--repeat`), and prints
+each round's index. A run whose rounds spread wider than the tolerance says
+so (`NOISY`), because it cannot vouch for its verdict.
+
+**Both Go lanes run with GOMAXPROCS=1.** With the default, a Go process on
+the M4 lands, per process and at random, in a fast or a slow mode for its
+first shapes. psgo's `loop-null@10000` measured ~187 µs or ~440 µs, slow in
+9 of 20 fresh processes. backend-go's calibration shape `loop-fore@10000`
+measured ~400 µs or ~910 µs, and when it landed slow every backend-go ratio
+moved by 2.2x at once, enough to fail main's per-shape gate on noise. GOGC=off
+and asyncpreemptoff did not change it; GOMAXPROCS=1 brought it to 1 in 20 and
+0 in 30. The corpus is single-threaded, so one P is the honest
+configuration; it costs psgo ~15 % on allocation-heavy shapes (no parallel
+GC), the same every run. As a backstop, a shape whose steady time varies by
+more than 1.5x between the rounds of the recording run is left out of the
+index (`unstable` in the baseline file); it is still measured and
+ratio-gated.
+
+Noise on the Mac Mini M4 (loaded, other sessions running), 10 back-to-back
+runs at the default `--repeat 3`:
+
+| | psgo index | backend-go index |
+|---|---|---|
+| default GOMAXPROCS | 3.02 – 3.45 (spread **1.141x**) | 1.155 – 1.208 (1.047x) |
+| GOMAXPROCS=1 | 3.41 – 3.53 (spread **1.033x**) | 1.181 – 1.269 (1.074x) |
+
+Then 14 gated runs against the recorded baseline, unchanged tree: all
+passed, the largest deviation 1.033x (psgo) and 0.932x (backend-go, one
+run, while the JS side drifted).
+
+What the index catches, demonstrated with planted changes:
+
+- A fixed cost on every Effect step in psgo's runtime (bind, pure, Ref
+  access, each `forE`/`whileE` iteration) moved the psgo index by 1.27–1.30x
+  over three runs: MOVED, exit 1. On the same runs no gated per-shape ratio
+  passed 2.0x (largest `loop-null` 1.69x); several moved *down*, because the
+  calibration shape slowed too. backend-go, not planted, stayed at
+  1.02x.
+- The compiler as it was before Gnomon#3 (TCO) moved the psgo index only
+  1.03–1.05x: ok, and correctly so. The corpus never recurses deep enough
+  for TCO to matter (≤1e4), which is G8's other half.
+
 ## What the first run found (2026-08-01, M4 MBP)
 
 **Gnomon has no compilation signal, and the whole corpus runs in 2.3 s.**
@@ -194,7 +264,7 @@ Jurist's first run; they cost nothing here and the corpus is shared.
 | `src/Bench/Clock.purs` | the one foreign: a monotonic clock, a stdout flush, and the two FFI probes |
 | `src/Bench/Clock.js`, `src/Bench/Clock.go` | its implementations, co-located with the `.purs` |
 | `run_perf.py` | build, run, derive ratios, compare — **per-backend** |
-| `baseline.json` | recorded ratios and checksums |
+| `baselines/<host>-<cpu>.json` | one machine's recorded ratios, speed index and checksums |
 
 `src/Bench/Shapes.purs` and `src/Bench/Main.purs` are byte-identical to the
 copies in `purescript-julia/perf/` and `purescript-python/perf/`; `md5` them
