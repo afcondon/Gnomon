@@ -154,12 +154,16 @@ the win through it.
   ADR from outside it.
 - **Performance claims** come from the repo's own canaries (`perf/`,
   `perf-seam/`), as before and after, with the machine named. From X3 on,
-  drift is gated three ways:
+  drift is gated in four ways:
   - **per-machine baselines** in `perf/baselines/<host>-<cpu>.json`, because
     a baseline from one machine does not transfer to another;
   - a **speed index against JS**, which catches a change that moves every
     benchmark at once;
-  - **`--repeat`**, with a NOISY label when runs disagree.
+  - **`--repeat`**, with a NOISY label when runs disagree;
+  - **first calls and start-up** (from October 2026): a first-call index
+    against JS and start-up in ms, each with a tolerance per runtime,
+    strict on Julia and loose or not gated on Python and Go. The output
+    says which numbers are not gated.
 
   A deliberate speed change re-records this machine's baseline
   (`--update-baseline`) in the same PR.

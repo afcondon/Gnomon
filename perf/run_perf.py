@@ -175,26 +175,28 @@ RUNTIME = {
 
 # How far the first-call index and start-up may move, per runtime, either
 # way, before the gate fires. None means recorded and printed, never gated.
-# Set from four runs of each repo at --repeat 3 on the Mac Mini M4 at load
-# 11-14 (an smbd copy holding ~7 cores), 2026-10-27; perf/README.md has
-# them, with a quiet x86 machine beside them.
+# Set from every run of an unchanged tree at --repeat 3 on the Mac Mini M4
+# at load 10-14 (an smbd copy holding ~7 cores), 2026-10-27: nine runs of
+# Jurist, seven each of Pythia and Gnomon. perf/README.md has them, beside
+# four runs on an idle x86 box (BlackStar, load ~0.5), where every
+# first-call index spread 1.10x or less: most of the noise below is load.
 #
 #   julia   first calls are compilation, the real cost on Julia and what
-#           Jurist#3 moved 13x (15x on backend-jl). Over seven runs of an
-#           unchanged tree the index ranged 1.05x on jl but 1.16x on
+#           Jurist#3 moved 13x (15x on backend-jl). Over nine runs of an
+#           unchanged tree the index ranged 1.05x on jl but 1.19x on
 #           backend-jl, whose 0.28 s of first calls is short enough for
 #           load to reach: at the speed index's 1.10 one of those runs
 #           fired (0.902x). 1.25 sits above that and still sees a change a
 #           tenth the size of Jurist#3's. Start-up (9.3 s on jl)
-#           spread 1.008x, but it is absolute, so a change in machine load
+#           spread 1.017x, but it is absolute, so a change in machine load
 #           between the baseline and the run moves it with nothing to
 #           cancel against: 1.25 leaves room for that.
 #   python  a first call is a run plus imports. The index spread 1.46x
-#           between runs under that load, so 2.0, the per-shape bound,
-#           catches a doubling and nothing finer. Start-up is ~30 ms and
-#           its medians ranged 27-74 ms: not gated.
+#           between runs under that load (1.05x on the idle box), so 2.0,
+#           the per-shape bound, catches a doubling and nothing finer.
+#           Start-up is ~30 ms and its medians ranged 27-74 ms: not gated.
 #   go      compiled ahead of time, so a first call is just a run; but the
-#           index is steady (spread 1.05x psgo, 1.02x backend-go), so a
+#           index is steady (spread 1.09x psgo, 1.08x backend-go), so a
 #           loose 1.5 is free and catches first-call-only cost (lazy
 #           initialisation, say). Start-up is ~3 ms of process creation:
 #           not gated.
