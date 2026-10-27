@@ -2378,11 +2378,16 @@ func _arrayIndex(a, i any) any { return a.([]any)[i.(int)] }
 // Native int division with PureScript semantics: div-by-zero is 0 (the JS
 // foreign returns 0), truncation toward zero (Go `/` already does). Used by the
 // unboxed-int-loop codegen where `/` would otherwise panic on a zero divisor.
+// Euclidean, as _intDiv and the JS foreign. Go's / truncates toward zero, so
+// (-7)/2 was -3 here where JS gives -4.
 func _intDivI(a, b int) int {
 	if b == 0 {
 		return 0
 	}
-	return a / b
+	if b > 0 {
+		return _floorDivPos(a, b)
+	}
+	return -_floorDivPos(a, -b)
 }
 
 // Immutable record update: copy the base record, overwrite the given fields.
