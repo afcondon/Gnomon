@@ -180,9 +180,12 @@ RUNTIME = {
 # them, with a quiet x86 machine beside them.
 #
 #   julia   first calls are compilation, the real cost on Julia and what
-#           Jurist#3 moved 13x. The index spread 1.025x (jl) and 1.03x
-#           (backend-jl) between runs, so 1.10, the speed index's bound,
-#           has three times the noise as headroom. Start-up (9.3 s on jl)
+#           Jurist#3 moved 13x (15x on backend-jl). Over seven runs of an
+#           unchanged tree the index ranged 1.05x on jl but 1.16x on
+#           backend-jl, whose 0.28 s of first calls is short enough for
+#           load to reach: at the speed index's 1.10 one of those runs
+#           fired (0.902x). 1.25 sits above that and still sees a change a
+#           tenth the size of Jurist#3's. Start-up (9.3 s on jl)
 #           spread 1.008x, but it is absolute, so a change in machine load
 #           between the baseline and the run moves it with nothing to
 #           cancel against: 1.25 leaves room for that.
@@ -195,7 +198,7 @@ RUNTIME = {
 #           loose 1.5 is free and catches first-call-only cost (lazy
 #           initialisation, say). Start-up is ~3 ms of process creation:
 #           not gated.
-FIRST_TOLERANCE = {"julia": 1.10, "python": 2.0, "go": 1.5}
+FIRST_TOLERANCE = {"julia": 1.25, "python": 2.0, "go": 1.5}
 STARTUP_TOLERANCE = {"julia": 1.25, "python": None, "go": None}
 
 # Two filters decide whether a row is GATED (counts toward failure) or merely
