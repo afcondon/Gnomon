@@ -50,24 +50,32 @@ WHY FIRST CALLS AND START-UP ARE TRACKED TOO
 The speed index is steady state only, and steady state is not what a Julia
 user waits for: Jurist#3 cut the first calls of the whole corpus from 7.3 s
 to 0.55 s, and no gated number said so. So each backend gets two more
-numbers per run, both against JS in the same run, as the speed index is:
+numbers per run:
 
   first-call index  sum of first(backend) over the recorded rows, divided by
-                    the same sum on JS. Every shape at every size, because on
-                    Julia compilation happens at the SMALL sizes; a sum,
-                    because the time a user waits is a sum, and because the
-                    rows a timer cannot resolve then weigh nothing.
+                    the same sum on JS in the same run, as the speed index
+                    is. Every shape at every size, because on Julia
+                    compilation happens at the SMALL sizes; a sum, because
+                    the time a user waits is a sum, and because the rows a
+                    timer cannot resolve then weigh nothing.
   start-up          ms from spawning the process to its first line of
                     output: runtime start, loading the program, and on Julia
-                    lowering it. What a user of a Go binary or a Julia script
-                    feels before any PureScript runs. Reported as a ratio to
-                    JS's start-up, for the same reason.
+                    compiling its top level. What a user of a Go binary or a
+                    Julia script feels before any PureScript runs; on the
+                    Jurist oracle lane it is 9.3 s, seventeen times its first
+                    calls. In ms against this machine's baseline, NOT as a
+                    ratio to JS: node starts in ~60 ms, and under load that
+                    moved by 30 % between runs while Julia's 9.3 s moved by
+                    under 1 %, so dividing by it would only import its noise.
+                    The median over rounds, so a cold first start (Python
+                    writing bytecode, macOS checking a new binary) drops out.
 
-What they mean differs by runtime, so their tolerances do too (RUNTIME and
-FIRST_TOLERANCE below): strict on Julia, where a first call is mostly
-compilation; looser on Python; and on Go, compiled ahead of time, a first
-call is just a run, so it is recorded and reported but never gated, and the
-output says so.
+What they mean differs by runtime, so their tolerances do too (RUNTIME,
+FIRST_TOLERANCE and STARTUP_TOLERANCE below, with the runs behind them):
+strict on Julia, where a first call is mostly compilation; looser on
+Python; and on Go, compiled ahead of time, a first call is just a run. A
+number with no tolerance is recorded and printed, never gated, and the
+output says so on every run.
 
 WHY THE BASELINE IS PER MACHINE
 -------------------------------
@@ -165,17 +173,30 @@ RUNTIME = {
     "go": "go", "backend-go": "go",
 }
 
-# How far the first-call index and the start-up ratio may move, per runtime,
-# before the gate fires. None means recorded and reported, never gated.
-# perf/README.md has the runs behind each number.
+# How far the first-call index and start-up may move, per runtime, either
+# way, before the gate fires. None means recorded and printed, never gated.
+# Set from four runs of each repo at --repeat 3 on the Mac Mini M4 at load
+# 11-14 (an smbd copy holding ~7 cores), 2026-10-27; perf/README.md has
+# them, with a quiet x86 machine beside them.
 #
-#   julia   first calls are compilation, the real cost on Julia, and the
-#           thing Jurist#3 moved by 13x. Strict.
-#   python  first calls are a run plus imports and bytecode caches: looser.
-#   go      ahead-of-time compiled; a first call is just a run, and start-up
-#           is a few ms of process creation. Not gated.
-FIRST_TOLERANCE = {"julia": 1.5, "python": 1.5, "go": None}
-STARTUP_TOLERANCE = {"julia": 1.5, "python": 1.5, "go": None}
+#   julia   first calls are compilation, the real cost on Julia and what
+#           Jurist#3 moved 13x. The index spread 1.025x (jl) and 1.03x
+#           (backend-jl) between runs, so 1.10, the speed index's bound,
+#           has three times the noise as headroom. Start-up (9.3 s on jl)
+#           spread 1.008x, but it is absolute, so a change in machine load
+#           between the baseline and the run moves it with nothing to
+#           cancel against: 1.25 leaves room for that.
+#   python  a first call is a run plus imports. The index spread 1.46x
+#           between runs under that load, so 2.0, the per-shape bound,
+#           catches a doubling and nothing finer. Start-up is ~30 ms and
+#           its medians ranged 27-74 ms: not gated.
+#   go      compiled ahead of time, so a first call is just a run; but the
+#           index is steady (spread 1.05x psgo, 1.02x backend-go), so a
+#           loose 1.5 is free and catches first-call-only cost (lazy
+#           initialisation, say). Start-up is ~3 ms of process creation:
+#           not gated.
+FIRST_TOLERANCE = {"julia": 1.10, "python": 2.0, "go": 1.5}
+STARTUP_TOLERANCE = {"julia": 1.25, "python": None, "go": None}
 
 # Two filters decide whether a row is GATED (counts toward failure) or merely
 # reported. Both express the same idea: a measurement has to carry information
@@ -564,15 +585,6 @@ def first_index(results, rows_for):
     return out
 
 
-def startup_ratio(startups):
-    """-> {backend: ms(backend) / ms(js)}, from {backend: ms}."""
-    js = startups.get("js")
-    if not js:
-        return {}
-    return {b: ms / js for b, ms in startups.items()
-            if b != "js" and ms is not None}
-
-
 def all_names(rows):
     return sorted(f"{k[0]}@{k[1]}" for k in rows)
 
@@ -652,28 +664,26 @@ def check_index(results, baseline, rounds):
 
 
 def check_first(results, baseline, rounds, startups, round_startups):
-    """First-call index and start-up ratio against the baseline, with each
-    runtime's own tolerance. -> (lines, hard)"""
+    """First-call index and start-up against the baseline, each with its
+    runtime's tolerance. -> (lines, hard)"""
     lines, hard = [], 0
     recorded = baseline.get("first_index", {})
     rows_for = lambda b: recorded.get(b, {}).get("rows", [])
     now = first_index(results, rows_for)
     per_round = [first_index(r, rows_for) for r in rounds]
     s_was = baseline.get("startup", {})
-    s_now = startup_ratio(startups)
-    s_rounds = [startup_ratio(r) for r in round_startups]
     for b in sorted(results):
         if b == "js":
             continue
         rt = RUNTIME[b]
-        for what, tol, was, cur, each in (
+        for what, tol, was, cur, each, unit in (
                 ("first-call index", FIRST_TOLERANCE[rt],
                  recorded.get(b, {}).get("index"),
                  now.get(b, (None,))[0],
-                 [r[b][0] for r in per_round if b in r]),
+                 [r[b][0] for r in per_round if b in r], "x js"),
                 ("start-up", STARTUP_TOLERANCE[rt],
-                 s_was.get(b, {}).get("ratio"), s_now.get(b),
-                 [r[b] for r in s_rounds if b in r])):
+                 s_was.get(b, {}).get("ms"), startups.get(b),
+                 [r[b] for r in round_startups if r.get(b)], "ms")):
             if was is None or cur is None:
                 lines.append(f"  {b}: {what}: "
                              + ("not in this machine's baseline" if was is None
@@ -683,17 +693,16 @@ def check_first(results, baseline, rounds, startups, round_startups):
             factor = cur / was
             spread = max(each) / min(each) if each else 1.0
             if tol is None:
-                verdict = (f"report only: {rt} is compiled ahead of time, so "
-                           "this is not gated")
+                verdict = f"not gated on {rt}, recorded only"
             else:
                 moved = factor > tol or factor < 1.0 / tol
                 hard += moved
                 verdict = (f"tolerance {tol}x, {'MOVED' if moved else 'ok'}"
                            + (f"; NOISY, rounds spread {spread:.3f}x, wider "
                               "than the tolerance" if spread > tol else ""))
-            unit = "x js" + (f" ({startups[b]:.0f} ms)" if what == "start-up"
-                             else "")
-            lines.append(f"  {b}: {what} {was:.3f} -> {cur:.3f} {unit} "
+            fmt = (lambda x: f"{x:.3f}") if unit == "x js" else \
+                  (lambda x: f"{x:.0f}")
+            lines.append(f"  {b}: {what} {fmt(was)} -> {fmt(cur)} {unit} "
                          f"[{factor:.3f}x, {verdict}]")
         missing = sorted(set(rows_for(b)) - set(now.get(b, (0, []))[1]))
         if missing:
@@ -869,8 +878,8 @@ def to_baseline(results, rounds=(), startups=None):
                  "and run; `fs` is first/steady; `index` is the geometric mean "
                  "of steady(backend)/steady(js) over `rows`, same run; "
                  "`first_index` is sum(first) over sum(first on js) over its "
-                 "`rows`; `startup` is ms to first output and its ratio to "
-                 "js. None of "
+                 "`rows`; `startup` is the median ms to first output. "
+                 "None of "
                  "them transfers between machines, so this file speaks only "
                  "for the machine named in `machine`."),
         "index": {
@@ -884,11 +893,8 @@ def to_baseline(results, rounds=(), startups=None):
                 results, lambda b: all_names(results[b])).items())
         },
         "startup": {
-            b: {"ms": round(startups[b], 1),
-                "ratio": round(ratio, 6) if b != "js" else 1.0}
-            for b, ratio in sorted({**startup_ratio(startups or {}),
-                                    "js": 1.0}.items())
-            if (startups or {}).get(b) is not None
+            b: {"ms": round(ms, 1)}
+            for b, ms in sorted((startups or {}).items()) if ms is not None
         },
         "backends": {
             b: {
@@ -1051,7 +1057,7 @@ def main():
             first_lines, first_hard = check_first(
                 results, baseline, rounds, startups, round_startups)
             print("FIRST CALLS AND START-UP (tolerance per runtime, "
-                  "either way)")
+                  "either way; see FIRST_TOLERANCE)")
             for line in first_lines:
                 print(line)
             if (hard or index_hard or first_hard) and args.gate_drift:
