@@ -52,6 +52,23 @@ data GoExpr
   | GoBinary Text GoExpr GoExpr
   -- | A pre-rendered raw Go expression escape hatch (FFI shim bodies, runtime helpers)
   | GoRaw Text
+  -- | Call a value after asserting its function type: @(f).(T)(args...)@.
+  -- Used for an inlined @runFnN@ (@T = func(...any) any@) and for running an
+  -- inlined Effect (@T = func() any@, no arguments).
+  | GoTypedCall Text GoExpr [GoExpr]
+  -- | @(e).(T)@: an operand of an inlined primitive op, unboxed from @any@.
+  | GoAssert Text GoExpr
+  -- | A Go-typed expression of static type @T@ (an inlined primitive op,
+  -- ADR-0009). Rendered boxed, @any(e)@, so whatever binds it still holds
+  -- an @any@; an enclosing op of the same type takes the inner value bare.
+  | GoTyped Text GoExpr
+  -- | A unary operator: @-x@, @!b@, @^n@.
+  | GoUnary Text GoExpr
+  -- | A variadic closure, an uncurried @Fn@/@EffectFn@:
+  -- @func(_args ...any) any { <stmts> }@.
+  | GoVariadic [GoStmt]
+  -- | A zero-argument closure, an @Effect@ thunk: @func() any { <stmts> }@.
+  | GoThunk [GoStmt]
   deriving (Show, Eq)
 
 -- | Go statements (the thing the family emitter could not produce).

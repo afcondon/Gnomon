@@ -23,7 +23,7 @@ import Node.FS.Perms as Perms
 import Node.Path (FilePath)
 import Node.Path as Path
 import Node.Process as Process
-import PureScript.Backend.Optimizer.Codegen.Go (codegenModule)
+import PureScript.Backend.Optimizer.Codegen.Go (codegenModule, knownArities)
 import PureScript.Backend.Optimizer.Codegen.Go.Builder (basicBuildMain)
 import PureScript.Backend.Optimizer.CoreFn (Ident(..), Module(..), ModuleName(..), Qualified(..))
 import PureScript.Backend.Optimizer.Reachability (pruneModule, reachableFromEntry)
@@ -99,15 +99,15 @@ build args = do
         let
           entry = Qualified (Just (ModuleName args.mainModule)) (Ident "main")
           reachable = reachableFromEntry entry modules
-        -- emit only modules with a reachable binding, each pruned to its reachable set
+          -- emit only modules with a reachable binding, each pruned to its reachable set
+          prunedModules = Array.mapMaybe (pruneModule reachable) modules
+          -- Saturated calls (ADR-0009) need the arity of every emitted function.
+          arities = knownArities prunedModules
         emittedRef <- liftEffect (Ref.new Set.empty)
-        for_ modules \backendMod ->
-          case pruneModule reachable backendMod of
-            Nothing -> pure unit
-            Just pruned -> do
+        for_ prunedModules \pruned -> do
               let
                 ModuleName name = pruned.name
-                formatted = Dodo.print Dodo.plainText Dodo.twoSpaces (codegenModule { intTags: false } pruned)
+                formatted = Dodo.print Dodo.plainText Dodo.twoSpaces (codegenModule { intTags: false, arities } pruned)
               FS.writeTextFile UTF8 (Path.concat [ args.outputDir, goIdent name <> ".go" ]) formatted
               liftEffect (Ref.modify_ (Set.insert name) emittedRef)
         copyPackageForeigns args.foreignDir args.outputDir

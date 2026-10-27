@@ -12,7 +12,11 @@ decision resolves.
 ## Decision
 
 - `any` everywhere. No attempt to recover PureScript types in Go types.
-- Curried unary closures — one argument per `func`, as the JS backend emits.
+- ~~Curried unary closures — one argument per `func`, as the JS backend emits.~~
+  *Superseded in part, 2026-10-27, by [ADR-0009](0009-saturated-calls-and-inliner.md):*
+  a function *value* is still a curried unary closure, but a call of a
+  known-arity top-level function with enough arguments is a plain Go call of
+  its saturated entry point.
 - ADTs as `V{Tag, Fields}`.
 - Records and dictionaries as `map[string]any`.
 - Effects as `func() any`; `nil` is `Unit`.

@@ -66,13 +66,17 @@ prettyProgram ds =
         | (n, e) <- vars ]
       initFn   = "func init() {\n" <> initBody <> "\n}"
   in T.intercalate "\n\n"
-       (  map prettyDecl others
+       (  map (prettyDecl . forceFunc names) others
        ++ [ varDecls | not (null vars) ]
        ++ [ initFn   | not (null vars) ]
        )
   where
     isVarDecl (GoVarDecl _ _) = True
     isVarDecl _               = False
+    -- A saturated entry point (ADR-0009) is a plain Go func, not a lazy var,
+    -- but its body refers to generated bindings like any initializer does.
+    forceFunc gen (GoFuncDecl n ps body) = GoFuncDecl n ps (map (forceRefsStmt gen) body)
+    forceFunc _ d = d
 
 -- Note on lazy init
 -- -----------------
@@ -95,7 +99,13 @@ prettyProgram ds =
 -- generated-name tokens are patched textually (locals and prelude shims are not
 -- in @gen@ and are left untouched).
 forceRefs :: Set.Set Text -> GoExpr -> GoExpr
-forceRefs gen = goE
+forceRefs gen = fst (forceRefsWith gen)
+
+forceRefsStmt :: Set.Set Text -> GoStmt -> GoStmt
+forceRefsStmt gen = snd (forceRefsWith gen)
+
+forceRefsWith :: Set.Set Text -> (GoExpr -> GoExpr, GoStmt -> GoStmt)
+forceRefsWith gen = (goE, goS)
   where
     goE e = case e of
       GoVar n | n `Set.member` gen -> GoRaw ("_force(" <> n <> ")")
@@ -112,6 +122,12 @@ forceRefs gen = goE
       GoSliceIndex x i -> GoSliceIndex (goE x) (goE i)
       GoBinary op a b  -> GoBinary op (goE a) (goE b)
       GoRaw t          -> GoRaw (patchTokens gen t)
+      GoTypedCall t f as -> GoTypedCall t (goE f) (map goE as)
+      GoAssert t x     -> GoAssert t (goE x)
+      GoTyped t x      -> GoTyped t (goE x)
+      GoUnary op x     -> GoUnary op (goE x)
+      GoVariadic body  -> GoVariadic (map goS body)
+      GoThunk body     -> GoThunk (map goS body)
       _                -> e            -- literals / nil
     goS s = case s of
       GoReturn e       -> GoReturn (goE e)
@@ -190,6 +206,28 @@ prettyExpr = \case
   GoCurriedApp fn arg ->
     "(" <> prettyExpr fn <> ").(func(any) any)(" <> prettyExpr arg <> ")"
 
+  -- A call through an asserted function type. A func LITERAL already has
+  -- its concrete type, and Go asserts only on interfaces, so it is called
+  -- directly (as GoCurriedApp does for a closure literal).
+  GoTypedCall _ fn args | isFuncLit fn ->
+    "(" <> prettyExpr fn <> ")(" <> T.intercalate ", " (map prettyExpr args) <> ")"
+  GoTypedCall ty fn args ->
+    "(" <> prettyExpr fn <> ").(" <> ty <> ")(" <> T.intercalate ", " (map prettyExpr args) <> ")"
+
+  GoAssert ty e -> "(" <> prettyExpr e <> ").(" <> ty <> ")"
+
+  -- Boxed back to `any`, so a `:=` binding of it is an interface as every
+  -- other local is (see GoTyped).
+  GoTyped _ e -> "any(" <> prettyExpr e <> ")"
+
+  GoUnary op e -> "(" <> op <> "(" <> prettyExpr e <> "))"
+
+  GoVariadic body ->
+    "func(_args ...any) any {\n" <> prettyStmts body <> "\n}"
+
+  GoThunk body ->
+    "func() any {\n" <> prettyStmts body <> "\n}"
+
   -- Raw call: f(a, b)
   GoCall fn args ->
     prettyExpr fn <> "(" <> T.intercalate ", " (map prettyExpr args) <> ")"
@@ -225,3 +263,11 @@ prettyExpr = \case
 
   GoBinary op a b ->
     "(" <> prettyExpr a <> " " <> op <> " " <> prettyExpr b <> ")"
+
+-- | A function literal, whose Go type is concrete rather than @any@.
+isFuncLit :: GoExpr -> Bool
+isFuncLit = \case
+  GoClosure _ _ -> True
+  GoVariadic _  -> True
+  GoThunk _     -> True
+  _             -> False

@@ -12,7 +12,7 @@ backfilled)"; 0007 records a decision visible only in the repo's shape.
 
 | ADR | subject | status |
 |---|---|---|
-| [0001](0001-runtime-representation.md) | Runtime representation | Accepted |
+| [0001](0001-runtime-representation.md) | Runtime representation | Accepted; calls superseded in part by 0009 |
 | [0002](0002-statement-form-via-go-ast.md) | Statement-form via Go AST + gofmt | Accepted |
 | [0003](0003-tco-trampoline.md) | TCO trampoline | Accepted (self tail calls as `for {}`, 2026-10-26) |
 | [0004](0004-module-layout.md) | Flat package, no loader | Accepted |
@@ -20,6 +20,7 @@ backfilled)"; 0007 records a decision visible only in the repo's shape.
 | [0006](0006-conformance-first.md) | Conformance-first | Accepted |
 | [0007](0007-two-implementations.md) | Two implementations: oracle + optimizer | Accepted |
 | [0008](0008-unused-pass.md) | The Unused pass; liveness is structural | Accepted |
+| [0009](0009-saturated-calls-and-inliner.md) | Saturated calls and the purs inliner set | Accepted (2026-10-27; supersedes part of 0001) |
 
 The family's fuller treatments live in Jurist's `docs/design-decisions/`, which
 Gnomon inherits where it does not diverge — notably **Jurist** ADR-0004

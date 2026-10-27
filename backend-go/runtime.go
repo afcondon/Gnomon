@@ -2495,6 +2495,7 @@ var NaN any = math.NaN()
 var _posInf any = math.Inf(1)
 var _negInf any = math.Inf(-1)
 var _nan any = math.NaN()
+var _negZero any = math.Copysign(0, -1)
 
 var Data_Reflectable_unsafeCoerce any = func(x any) any { return x }
 
