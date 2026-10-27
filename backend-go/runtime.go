@@ -192,6 +192,22 @@ func _showNumber(f float64) string {
 
 // JS bitwise ops coerce operands and result through ToInt32 / ToUint32.
 func _toInt32(x int) int  { return int(int32(uint32(x))) }
+
+// _floatToInt32 is ECMAScript ToInt32 on a double: NaN and the infinities are
+// 0, anything else is truncated and taken modulo 2^32. Converting first with
+// int64(f) is not that: Go leaves an out-of-range float-to-int conversion
+// implementation-defined, and arm64 saturates while amd64 does not, so
+// `Int.pow 10 400` was -1 on an M-series Mac and 0 on an x86 CI runner.
+func _floatToInt32(f float64) int {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0
+	}
+	m := math.Mod(math.Trunc(f), 4294967296)
+	if m < 0 {
+		m += 4294967296
+	}
+	return int(int32(uint32(m)))
+}
 func _toUint32(x int) int { return int(uint32(x)) }
 
 // Shared stable merge sort (Data.Array.sortByImpl + Data.Array.ST.sortByImpl).
@@ -907,7 +923,7 @@ var Data_Int_rem any = func(x any) any {
 }
 var Data_Int_pow any = func(x any) any {
 	return func(y any) any {
-		return _toInt32(int(int64(math.Pow(float64(x.(int)), float64(y.(int))))))
+		return _floatToInt32(math.Pow(float64(x.(int)), float64(y.(int))))
 	}
 }
 var Data_Int_toStringAs any = func(radix any) any {

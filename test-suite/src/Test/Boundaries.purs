@@ -288,6 +288,11 @@ numberLimits = do
   t "num-nan-compare" (show (compare (0.0 / 0.0) 1.0))
   t "num-min-nan" (show (Num.min (0.0 / 0.0) 1.0))
   t "num-max-nan" (show (Num.max (0.0 / 0.0) 1.0))
+  -- NaN in the SECOND argument too: Python's built-in max/min keep their
+  -- first argument when a comparison is false, so only this order caught
+  -- a shim that answered 1.0 where JS answers NaN.
+  t "num-min-nan-right" (show (Num.min 1.0 (0.0 / 0.0)))
+  t "num-max-nan-right" (show (Num.max 1.0 (0.0 / 0.0)))
 
 --------------------------------------------------------------------------
 -- Number — integer representability

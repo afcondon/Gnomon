@@ -69,6 +69,12 @@ main = do
   t "int-pow" (show (Int.pow 2 10))
   t "int-pow-zero" (show (Int.pow 5 0))
   t "int-pow-wrap" (show (Int.pow 2 31))
+  -- Past the double range: JS's Math.pow gives +/-Infinity and ToInt32 makes
+  -- it 0. A float ** float that raises OverflowError is not an answer.
+  t "int-pow-overflow" (show (Int.pow 10 400))
+  t "int-pow-overflow-neg" (show (Int.pow (-10) 401))
+  -- Finite but past int64: ToInt32 takes it modulo 2^32, it does not clamp.
+  t "int-pow-past-int64" (show (Int.pow 10 30))
   -- conversions
   t "int-toNumber" (show (Int.toNumber 5))
   t "int-fromNumber-ok" (show (Int.fromNumber 5.0))
