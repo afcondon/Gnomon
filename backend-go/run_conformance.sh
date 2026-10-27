@@ -2,9 +2,10 @@
 # backend-go conformance: build the PS backend, emit Go for the whole corpus
 # (one corefn dir), then for each corpus module swap the entrypoint, `go build`
 # the whole package, run it, and diff against the JS reference. A module is
-# "green" if byte-identical, or differs ONLY on the seeded
-# INT64/ASTRAL/STACK/NEGZERO ledger
-# (Go int has no int32 wrap; Go strings count codepoints not UTF-16 units).
+# "green" if byte-identical, or differs ONLY on entries of the divergence
+# ledger (test-suite/divergences.json), with exactly the values recorded
+# there. The judge is test-suite/ledger.py, the same one the oracle lane uses,
+# so the two lanes cannot disagree about what counts as a known divergence.
 #
 # Usage: ./run_conformance.sh
 set -e
@@ -17,21 +18,21 @@ JSREF="$HERE/../test-suite"
 # result depends on what else is running is not a gate.
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
-OUT=/tmp/bgo-conf
+OUT="$TMPD/out"
 # Corpus modules are DISCOVERED, never listed by hand -- a hand-maintained list
 # is how Test.Maps sat unexecuted in this repo for weeks. Benchmarks are the
 # only exclusion: they measure rather than assert and print no TEST lines.
 mods=(${(f)"$(cd "$JSREF/src/Test" && ls *.purs | sed 's/\.purs$//' | grep -v '^Bench')"})
 
 echo "==> building backend-go"
-(cd "$HERE" && spago build >/dev/null 2>&1)
+# Not silenced. It was, and against an optimizer whose API had moved the build
+# failed, `spago run` below ran whatever stale output/ it found, and the lane
+# reported on a program nobody had built (review X7).
+(cd "$HERE" && spago build)
 
 # Per-entry pruning means each program is emitted for its OWN main: emitting
 # --main Test.X prunes away every binding unreachable from Test.X.main (and
 # writes its own entrypoint.go), so we emit once per module into a clean dir.
-# The seeded divergence ledger, as name markers. See the per-line check
-# below for why markers rather than a list of (module, test) pairs.
-LEDGER_MARKERS="INT64|ASTRAL|STACK|NEGZERO"
 pass=0; ledger=0; bad=0
 for m in $mods; do
   mod="Test.$m"
@@ -52,31 +53,21 @@ for m in $mods; do
     echo "[$mod] JSREF-ERR: $(grep -v '^$' "$TMPD/js_err.txt" | tail -1 | head -c 160)"; bad=$((bad+1)); continue
   fi
   nfiles=$(ls "$OUT"/*.go | wc -l | tr -d ' ')
-  if diff -q "$TMPD/js_out.txt" "$TMPD/go_out.txt" >/dev/null; then
-    echo "[$mod] OK identical ($(wc -l <"$TMPD/go_out.txt"|tr -d ' ') lines, $nfiles files)"; pass=$((pass+1))
-  # STACK belongs here too: both lanes' Effect.Exception.stackImpl returns
-  # Nothing (neither Go representation carries a stack), and the ORACLE lane
-  # has always ledgered it — this script's narrower pattern was the only reason
-  # Test.Exceptions read as a failure. Keep the two ledgers in step.
-  else
-    # Every DIVERGING LINE must carry a ledger marker, not merely one of them.
-    # `grep -q` over the whole diff passes a module that has one ledgered
-    # divergence AND one real regression — which is precisely how a gate stays
-    # green while it is broken. Test.Boundaries was doing exactly that: 13 of
-    # its ledgered entries had no marker and rode in on the ASTRAL/INT64 ones.
-    #
-    # This works because a ledgered divergence names its own cause: the
-    # convention is an INT64- / ASTRAL- / STACK- / NEGZERO- prefix on the test
-    # name, so both this lane and the oracle lane's explicit pair list read the
-    # same signal out of the same string, and there is no second list to drift.
-    unledgered="$(diff "$TMPD/js_out.txt" "$TMPD/go_out.txt" \
-                  | grep -E '^[<>]' | grep -viE "$LEDGER_MARKERS" || true)"
-    if [ -z "$unledgered" ]; then
-      echo "[$mod] OK ledger-only ($LEDGER_MARKERS, $nfiles files)"; ledger=$((ledger+1))
+  # Every TEST line is judged by name against the ledger, with values. The
+  # lane used to exempt any diff line matching INT64|ASTRAL|STACK|NEGZERO, so
+  # a regression in any test whose NAME carried one of those words passed
+  # (review X3 b).
+  if verdict="$(python3 "$JSREF/ledger.py" compare --lane backend-go "$mod" "$TMPD/js_out.txt" "$TMPD/go_out.txt")"; then
+    if diff -q "$TMPD/js_out.txt" "$TMPD/go_out.txt" >/dev/null; then
+      echo "[$mod] OK identical ($(wc -l <"$TMPD/go_out.txt"|tr -d ' ') lines, $nfiles files)"; pass=$((pass+1))
     else
-      echo "[$mod] FAIL:"; echo "$unledgered" | head -8; bad=$((bad+1))
+      echo "[$mod] OK ledger-only (${verdict##*RESULT }, $nfiles files)"; ledger=$((ledger+1))
     fi
+  else
+    echo "[$mod] FAIL:"; echo "$verdict" | grep -v '^  KNOWN' | head -12; bad=$((bad+1))
   fi
 done
+# An entry whose module has left the corpus is stale on this lane too.
+if ! python3 "$JSREF/ledger.py" stale --lane backend-go "${mods[@]/#/Test.}"; then bad=$((bad+1)); fi
 echo "=== $pass identical + $ledger ledger-only = $((pass+ledger))/${#mods[@]} green; $bad bad ==="
 [ $bad -eq 0 ]
