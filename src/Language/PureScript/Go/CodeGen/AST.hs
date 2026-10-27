@@ -67,6 +67,15 @@ data GoStmt
   | GoBlockStmt [GoStmt]              -- ^ { ... }
   | GoPanic Text                      -- ^ panic("...")  (pattern-match failure)
   | GoRawStmt Text                    -- ^ pre-rendered raw statement
+  -- | @a, b = x, y@: plain (not declaring) parallel assignment. Every right-
+  -- hand side is evaluated before any target is written, which is what a
+  -- self tail call's argument list needs. A target may be @_@.
+  | GoSet [Text] [GoExpr]
+  -- | @for { body }@: the unconditional loop a self-tail-recursive function
+  -- compiles to. Go counts it as a terminating statement, so the enclosing
+  -- function needs no trailing return.
+  | GoFor [GoStmt]
+  | GoContinue                        -- ^ continue  (next iteration of the enclosing GoFor)
   deriving (Show, Eq)
 
 -- | Top-level Go declarations.
