@@ -552,6 +552,20 @@ def check_index(results, baseline, rounds):
     return lines, hard
 
 
+def noisy_backends(baseline, rounds):
+    """Backends whose per-round speed indices spread wider than the
+    tolerance."""
+    recorded = baseline.get("index", {})
+    per_round = [speed_index(r, lambda b: recorded.get(b, {}).get("rows", []))
+                 for r in rounds]
+    out = []
+    for b in recorded:
+        each = [r[b][0] for r in per_round if b in r]
+        if each and max(each) / min(each) > INDEX_TOLERANCE:
+            out.append(b)
+    return out
+
+
 def check_baseline(results, baseline):
     """Drift against the recorded ratios.
 
@@ -760,17 +774,42 @@ def main():
     # one backend at a time, so that a change in machine load during the run
     # lands on the numerator and the denominator of the speed index alike.
     measured = {b: [] for b in wanted}
-    for i in range(args.repeat):
+
+    def run_rounds(n):
+        for i in range(n):
+            for b in wanted:
+                print(f"• running {b}, round {len(measured[b]) + 1} "
+                      f"(up to {TIMEOUT}s)...", file=sys.stderr)
+                lines, timed_out = run_backend(b, echo=args.echo)
+                measured[b].append(parse(lines, b, timed_out))
+
+    def summarise():
+        res, cal = {}, {}
         for b in wanted:
-            print(f"• running {b}, round {i + 1}/{args.repeat} "
-                  f"(up to {TIMEOUT}s)...", file=sys.stderr)
-            lines, timed_out = run_backend(b, echo=args.echo)
-            measured[b].append(parse(lines, b, timed_out))
-    results, calibrations = {}, {}
-    for b in wanted:
-        results[b], calibrations[b] = derive(median_rows(measured[b], b), b)
-    rounds = [{b: derive(measured[b][i], b)[0] for b in wanted}
-              for i in range(args.repeat)]
+            res[b], cal[b] = derive(median_rows(measured[b], b), b)
+        per_round = [{b: derive(measured[b][i], b)[0] for b in wanted}
+                     for i in range(len(measured[wanted[0]]))]
+        return res, cal, per_round
+
+    run_rounds(args.repeat)
+    results, calibrations, rounds = summarise()
+
+    # One second chance, and only one. When the rounds of a run disagree by
+    # more than the tolerance, the machine is too busy for that run to vouch
+    # for the gate either way (a NOISY verdict, see check_index). Taking the
+    # same number of rounds again and using the median over all of them is
+    # cheap, and often settles it; when it does not, the verdict stays NOISY
+    # and says so. It never retries until green.
+    gate_baseline = None
+    if not args.update_baseline and baseline_path().exists():
+        gate_baseline = json.loads(baseline_path().read_text())
+        if gate_baseline.get("schema") == BASELINE_SCHEMA and \
+                noisy_backends(gate_baseline, rounds):
+            print(f"• rounds disagree by more than {INDEX_TOLERANCE}x on "
+                  f"{', '.join(noisy_backends(gate_baseline, rounds))}; "
+                  f"taking {args.repeat} more", file=sys.stderr)
+            run_rounds(args.repeat)
+            results, calibrations, rounds = summarise()
 
     report(results, calibrations)
 
