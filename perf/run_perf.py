@@ -45,6 +45,30 @@ uniform change here moves the index by its own size. The mean over many
 shapes is also far quieter than any one ratio, which is what lets its
 tolerance be tight enough to see 20 %.
 
+WHY FIRST CALLS AND START-UP ARE TRACKED TOO
+--------------------------------------------
+The speed index is steady state only, and steady state is not what a Julia
+user waits for: Jurist#3 cut the first calls of the whole corpus from 7.3 s
+to 0.55 s, and no gated number said so. So each backend gets two more
+numbers per run, both against JS in the same run, as the speed index is:
+
+  first-call index  sum of first(backend) over the recorded rows, divided by
+                    the same sum on JS. Every shape at every size, because on
+                    Julia compilation happens at the SMALL sizes; a sum,
+                    because the time a user waits is a sum, and because the
+                    rows a timer cannot resolve then weigh nothing.
+  start-up          ms from spawning the process to its first line of
+                    output: runtime start, loading the program, and on Julia
+                    lowering it. What a user of a Go binary or a Julia script
+                    feels before any PureScript runs. Reported as a ratio to
+                    JS's start-up, for the same reason.
+
+What they mean differs by runtime, so their tolerances do too (RUNTIME and
+FIRST_TOLERANCE below): strict on Julia, where a first call is mostly
+compilation; looser on Python; and on Go, compiled ahead of time, a first
+call is just a run, so it is recorded and reported but never gated, and the
+output says so.
+
 WHY THE BASELINE IS PER MACHINE
 -------------------------------
 "Machine-independent" turned out to be false for both numbers: the first run
@@ -80,13 +104,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BASELINES = HERE / "baselines"
 
 SCHEMA = "1"
-BASELINE_SCHEMA = "2"
+BASELINE_SCHEMA = "3"
 
 # The calibration shape. Everything is expressed relative to this, per
 # backend, per run. `loop-fore` is the right choice because it is the
@@ -129,6 +154,28 @@ TOLERANCE = 2.0
 # ~20 % uniform change that Pythia#3 made and the old ratios could not see.
 # The same value as Pythia's and Jurist's, on purpose.
 INDEX_TOLERANCE = 1.10
+
+# Which runtime each lane runs on. The first-call and start-up tolerances
+# belong to the runtime, not the lane: the oracle lane and the optimizer lane
+# of one backend wait for the same compiler.
+RUNTIME = {
+    "js": "node",
+    "jl": "julia", "backend-jl": "julia",
+    "py": "python", "backend-py": "python",
+    "go": "go", "backend-go": "go",
+}
+
+# How far the first-call index and the start-up ratio may move, per runtime,
+# before the gate fires. None means recorded and reported, never gated.
+# perf/README.md has the runs behind each number.
+#
+#   julia   first calls are compilation, the real cost on Julia, and the
+#           thing Jurist#3 moved by 13x. Strict.
+#   python  first calls are a run plus imports and bytecode caches: looser.
+#   go      ahead-of-time compiled; a first call is just a run, and start-up
+#           is a few ms of process creation. Not gated.
+FIRST_TOLERANCE = {"julia": 1.5, "python": 1.5, "go": None}
+STARTUP_TOLERANCE = {"julia": 1.5, "python": 1.5, "go": None}
 
 # Two filters decide whether a row is GATED (counts toward failure) or merely
 # reported. Both express the same idea: a measurement has to carry information
@@ -240,6 +287,16 @@ def build():
     if not (GO_OUT / "Clock_foreign.go").exists():
         sys.exit("psgo did not copy the co-located Bench.Clock foreign — "
                  "run_perf.py must run with cwd = perf/")
+    # Built here, not with `go run` at run time: start-up is timed from the
+    # spawn, and `go run` would put Go's compiler inside it. A user of a Go
+    # program starts the binary; so does the lane, as backend-go's does.
+    print("• go build -> output-go/Bench.Main/bench...", file=sys.stderr)
+    r = subprocess.run(["go", "build", "-o", "bench", "main.go", "prelude.go",
+                        "Clock_foreign.go"], cwd=GO_OUT, capture_output=True,
+                       text=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr[-2000:])
+        sys.exit("psgo: go build failed")
 
 
 # -------------------------------------------------------------------- run --
@@ -248,13 +305,13 @@ JS_PATH = "./output/Bench.Main/index.js"
 
 GO_OUT = HERE / "output-go" / "Bench.Main"
 
-# `go run` compiles before it runs, but that happens at process level, outside
-# the harness's clock — so unlike Julia's per-call-site compilation it does not
-# show up in first-call timings, and f/s stays meaningful.
+# Go compiles ahead of time (build() runs `go build`), so unlike Julia's
+# per-call-site compilation nothing compiles inside the harness's clock, and
+# f/s stays meaningful.
 COMMANDS = {
     "js": ["node", "--input-type=module", "-e",
            f'import("{JS_PATH}").then(m => m.main())'],
-    "go": (["go", "run", "main.go", "prelude.go", "Clock_foreign.go"], GO_OUT),
+    "go": ([str(GO_OUT / "bench")], GO_OUT),
 }
 
 # The optimizer lane runs the same corpus through backend-go
@@ -334,7 +391,7 @@ TIMEOUT = 600
 
 
 def run_backend(name, echo=False):
-    """Stream the corpus, returning (lines, timed_out).
+    """Stream the corpus, returning (lines, timed_out, startup_ms).
 
     Streaming rather than capturing, because a lane that dies on a timeout
     with nothing on stdout tells you only that it died. With per-line flushes
@@ -343,6 +400,8 @@ def run_backend(name, echo=False):
     """
     cmd, cwd = COMMANDS[name] if isinstance(COMMANDS[name], tuple) \
         else (COMMANDS[name], HERE)
+    started = time.monotonic()
+    first_line = []
     proc = subprocess.Popen(
         cmd, cwd=cwd, text=True, env=ENV.get(name),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -354,6 +413,8 @@ def run_backend(name, echo=False):
     # reached — which is the failure mode this whole function exists to avoid.
     def pump():
         for line in proc.stdout:
+            if not first_line:
+                first_line.append(time.monotonic())
             lines.append(line.rstrip("\n"))
             if echo:
                 print(f"    {lines[-1]}", file=sys.stderr)
@@ -374,7 +435,8 @@ def run_backend(name, echo=False):
     if not timed_out and proc.returncode != 0:
         sys.stderr.write(stderr[-2000:])
         sys.exit(f"{name} exited {proc.returncode}")
-    return lines, timed_out
+    startup = (first_line[0] - started) * 1000.0 if first_line else None
+    return lines, timed_out, startup
 
 
 def parse(lines, who, timed_out):
@@ -478,6 +540,43 @@ def speed_index(results, rows_for):
     return out
 
 
+def first_index(results, rows_for):
+    """-> {backend: (index, [row names])}: sum of first-call times over the
+    rows, over the same sum on JS, same run. See the header."""
+    js = results.get("js")
+    out = {}
+    if js is None:
+        return out
+    for b, rows in results.items():
+        if b == "js":
+            continue
+        num = den = 0.0
+        used = []
+        for name in rows_for(b):
+            shape, n = name.rsplit("@", 1)
+            key = (shape, int(n))
+            if key in rows and key in js:
+                num += rows[key]["first"]
+                den += js[key]["first"]
+                used.append(name)
+        if used and den > 0:
+            out[b] = (num / den, used)
+    return out
+
+
+def startup_ratio(startups):
+    """-> {backend: ms(backend) / ms(js)}, from {backend: ms}."""
+    js = startups.get("js")
+    if not js:
+        return {}
+    return {b: ms / js for b, ms in startups.items()
+            if b != "js" and ms is not None}
+
+
+def all_names(rows):
+    return sorted(f"{k[0]}@{k[1]}" for k in rows)
+
+
 def gated_names(rows):
     return sorted(f"{k[0]}@{k[1]}" for k, v in rows.items() if v["gated"])
 
@@ -552,6 +651,57 @@ def check_index(results, baseline, rounds):
     return lines, hard
 
 
+def check_first(results, baseline, rounds, startups, round_startups):
+    """First-call index and start-up ratio against the baseline, with each
+    runtime's own tolerance. -> (lines, hard)"""
+    lines, hard = [], 0
+    recorded = baseline.get("first_index", {})
+    rows_for = lambda b: recorded.get(b, {}).get("rows", [])
+    now = first_index(results, rows_for)
+    per_round = [first_index(r, rows_for) for r in rounds]
+    s_was = baseline.get("startup", {})
+    s_now = startup_ratio(startups)
+    s_rounds = [startup_ratio(r) for r in round_startups]
+    for b in sorted(results):
+        if b == "js":
+            continue
+        rt = RUNTIME[b]
+        for what, tol, was, cur, each in (
+                ("first-call index", FIRST_TOLERANCE[rt],
+                 recorded.get(b, {}).get("index"),
+                 now.get(b, (None,))[0],
+                 [r[b][0] for r in per_round if b in r]),
+                ("start-up", STARTUP_TOLERANCE[rt],
+                 s_was.get(b, {}).get("ratio"), s_now.get(b),
+                 [r[b] for r in s_rounds if b in r])):
+            if was is None or cur is None:
+                lines.append(f"  {b}: {what}: "
+                             + ("not in this machine's baseline" if was is None
+                                else "not measured this run"))
+                hard += tol is not None
+                continue
+            factor = cur / was
+            spread = max(each) / min(each) if each else 1.0
+            if tol is None:
+                verdict = (f"report only: {rt} is compiled ahead of time, so "
+                           "this is not gated")
+            else:
+                moved = factor > tol or factor < 1.0 / tol
+                hard += moved
+                verdict = (f"tolerance {tol}x, {'MOVED' if moved else 'ok'}"
+                           + (f"; NOISY, rounds spread {spread:.3f}x, wider "
+                              "than the tolerance" if spread > tol else ""))
+            unit = "x js" + (f" ({startups[b]:.0f} ms)" if what == "start-up"
+                             else "")
+            lines.append(f"  {b}: {what} {was:.3f} -> {cur:.3f} {unit} "
+                         f"[{factor:.3f}x, {verdict}]")
+        missing = sorted(set(rows_for(b)) - set(now.get(b, (0, []))[1]))
+        if missing:
+            lines.append(f"  {b}: first-call index DNF on {', '.join(missing)}")
+            hard += FIRST_TOLERANCE[rt] is not None
+    return lines, hard
+
+
 def noisy_backends(baseline, rounds):
     """Backends whose per-round speed indices spread wider than the
     tolerance."""
@@ -604,7 +754,7 @@ def check_baseline(results, baseline):
 
 # ----------------------------------------------------------------- report --
 
-def report(results, calibrations):
+def report(results, calibrations, startups):
     backends = sorted(results)
     keys = sorted({k for rows in results.values() for k in rows},
                   key=lambda k: (k[0], k[1]))
@@ -617,6 +767,13 @@ def report(results, calibrations):
             results, lambda b: gated_names(results[b])).items()):
         print(f"speed index  {b}: {idx:.3f} x js (geomean over {len(used)} "
               f"gated shapes, this run)")
+    for b, (idx, used) in sorted(first_index(
+            results, lambda b: all_names(results[b])).items()):
+        print(f"first calls  {b}: {idx:.3f} x js (sum over {len(used)} rows, "
+              f"{sum(results[b][k]['first'] for k in results[b]) / 1e6:.2f} s)")
+    for b in sorted(startups):
+        if startups[b] is not None:
+            print(f"start-up     {b}: {startups[b]:.0f} ms to first output")
     print()
 
     head = f"{'shape':<16}{'n':>7}"
@@ -698,7 +855,7 @@ def index_rows(results, rounds):
                        if n not in unstable.get(b, {})]), unstable
 
 
-def to_baseline(results, rounds=()):
+def to_baseline(results, rounds=(), startups=None):
     rows_for, unstable = index_rows(results, rounds)
     return {
         "schema": BASELINE_SCHEMA,
@@ -710,13 +867,28 @@ def to_baseline(results, rounds=()):
         "note": ("Ratios, not milliseconds — see the header of run_perf.py. "
                  "`rel` is steady/steady(calibration) within the same backend "
                  "and run; `fs` is first/steady; `index` is the geometric mean "
-                 "of steady(backend)/steady(js) over `rows`, same run. None of "
+                 "of steady(backend)/steady(js) over `rows`, same run; "
+                 "`first_index` is sum(first) over sum(first on js) over its "
+                 "`rows`; `startup` is ms to first output and its ratio to "
+                 "js. None of "
                  "them transfers between machines, so this file speaks only "
                  "for the machine named in `machine`."),
         "index": {
             b: {"index": round(idx, 6), "rows": used,
                 "unstable": unstable.get(b, {})}
             for b, (idx, used) in sorted(speed_index(results, rows_for).items())
+        },
+        "first_index": {
+            b: {"index": round(idx, 6), "rows": used}
+            for b, (idx, used) in sorted(first_index(
+                results, lambda b: all_names(results[b])).items())
+        },
+        "startup": {
+            b: {"ms": round(startups[b], 1),
+                "ratio": round(ratio, 6) if b != "js" else 1.0}
+            for b, ratio in sorted({**startup_ratio(startups or {}),
+                                    "js": 1.0}.items())
+            if (startups or {}).get(b) is not None
         },
         "backends": {
             b: {
@@ -774,14 +946,16 @@ def main():
     # one backend at a time, so that a change in machine load during the run
     # lands on the numerator and the denominator of the speed index alike.
     measured = {b: [] for b in wanted}
+    started = {b: [] for b in wanted}
 
     def run_rounds(n):
         for i in range(n):
             for b in wanted:
                 print(f"• running {b}, round {len(measured[b]) + 1} "
                       f"(up to {TIMEOUT}s)...", file=sys.stderr)
-                lines, timed_out = run_backend(b, echo=args.echo)
+                lines, timed_out, startup = run_backend(b, echo=args.echo)
                 measured[b].append(parse(lines, b, timed_out))
+                started[b].append(startup)
 
     def summarise():
         res, cal = {}, {}
@@ -790,6 +964,13 @@ def main():
         per_round = [{b: derive(measured[b][i], b)[0] for b in wanted}
                      for i in range(len(measured[wanted[0]]))]
         return res, cal, per_round
+
+    def startup_medians():
+        med = {b: statistics.median(x for x in started[b] if x is not None)
+               for b in wanted if any(x is not None for x in started[b])}
+        each = [{b: started[b][i] for b in wanted}
+                for i in range(len(started[wanted[0]]))]
+        return med, each
 
     run_rounds(args.repeat)
     results, calibrations, rounds = summarise()
@@ -811,7 +992,8 @@ def main():
             run_rounds(args.repeat)
             results, calibrations, rounds = summarise()
 
-    report(results, calibrations)
+    startups, round_startups = startup_medians()
+    report(results, calibrations, startups)
 
     failures = 0
 
@@ -832,7 +1014,7 @@ def main():
     if args.update_baseline:
         path = baseline_path()
         BASELINES.mkdir(exist_ok=True)
-        path.write_text(json.dumps(to_baseline(results, rounds), indent=2) + "\n")
+        path.write_text(json.dumps(to_baseline(results, rounds, startups), indent=2) + "\n")
         print(f"baseline: rewritten (baselines/{path.name}) — "
               "say why in the commit message")
     elif not baseline_path().exists():
@@ -866,13 +1048,25 @@ def main():
             else:
                 print(f"ratios: no shape moved more than {TOLERANCE}x "
                       f"({n_gated} gated rows)")
-            if (hard or index_hard) and args.gate_drift:
+            first_lines, first_hard = check_first(
+                results, baseline, rounds, startups, round_startups)
+            print("FIRST CALLS AND START-UP (tolerance per runtime, "
+                  "either way)")
+            for line in first_lines:
+                print(line)
+            if (hard or index_hard or first_hard) and args.gate_drift:
                 failures += 1
 
     if args.json:
         Path(args.json).write_text(json.dumps(
             {"schema": SCHEMA,
              "calibration_us": calibrations,
+             "startup_ms": startups,
+             "rounds": [{"startup_ms": round_startups[i],
+                         "backends": {b: {f"{k[0]}@{k[1]}": v
+                                          for k, v in measured[b][i].items()}
+                                      for b in wanted}}
+                        for i in range(len(round_startups))],
              "backends": {b: {f"{k[0]}@{k[1]}": v for k, v in rows.items()}
                           for b, rows in results.items()}},
             indent=2) + "\n")
