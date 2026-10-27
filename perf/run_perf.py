@@ -289,6 +289,12 @@ def stage_backend_go():
     if not OPTIMIZER.is_dir():
         return None, (f"../{OPTIMIZER.name} is not checked out beside this "
                       "repo, so the optimizer lane has no compiler")
+    pin = (HERE.parent / "bin" / "optimizer-pin").read_text().split()[0]
+    head = subprocess.run(["git", "-C", str(OPTIMIZER), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    if head != pin:
+        return None, (f"../{OPTIMIZER.name} is at {head[:7]}, not the pinned "
+                      f"{pin[:7]} (bin/optimizer-pin)")
     out = Path(tempfile.mkdtemp(prefix="perf-backend-go-"))
     # spago can rewrite the dependency ranges in spago.yaml on a build
     # (review X7); put the tracked file back so a perf run leaves the tree as

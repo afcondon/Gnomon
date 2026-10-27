@@ -38,13 +38,27 @@ fi
 
 if [[ "$ONLY" == "both" || "$ONLY" == "optimizer" ]]; then
   echo "==> optimizer lane: backend-go over the shared corpus"
-  if [[ -d ../purescript-backend-optimizer ]]; then
+  # The optimizer is a sibling checkout, PINNED to the commit in
+  # bin/optimizer-pin. Unpinned, upstream b8d96a9 (2026-07-24) changed an API
+  # backend-go uses and the lane broke without anyone changing this repo (review
+  # X7). A checkout at any other commit is not the lane this repo vouches for,
+  # so it is NOT RUN, with the reason, rather than run and trusted. CI checks
+  # out exactly the pin, so the lane runs there.
+  opt_pin="$(head -1 bin/optimizer-pin)"
+  opt_dir=../purescript-backend-optimizer
+  opt_why=""
+  if [[ ! -d "$opt_dir" ]]; then
+    opt_why="$opt_dir is not checked out beside this repo"
+  elif [[ "$(git -C "$opt_dir" rev-parse HEAD)" != "$opt_pin" ]]; then
+    opt_why="$opt_dir is at $(git -C "$opt_dir" rev-parse --short HEAD), not the pinned ${opt_pin:0:7} (bin/optimizer-pin)"
+  fi
+  if [[ -z "$opt_why" ]]; then
     ( cd backend-go && ./run_conformance.sh )
   else
-    echo "    NOT RUN — ../purescript-backend-optimizer is not checked out beside this repo."
-    echo "    The optimizer lane needs it as a local sibling (see backend-go/README.md)."
+    echo "    NOT RUN — $opt_why."
+    echo "    To run it: git -C $opt_dir checkout $opt_pin (see backend-go/README.md)."
     if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-      echo "::warning title=Optimizer lane NOT RUN::backend-go was not tested: ../purescript-backend-optimizer is not checked out. Nothing here vouches for the optimizer lane."
+      echo "::warning title=Optimizer lane NOT RUN::backend-go was not tested: $opt_why. Nothing here vouches for the optimizer lane."
     fi
   fi
 fi

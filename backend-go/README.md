@@ -5,6 +5,18 @@ A **PureScript** PureScript→Go backend that consumes the optimized IR from
 rather than walking raw CoreFn ourselves (that is Phase 1, the Haskell `psgo`
 on `main`, which stays as the byte-identical **correctness oracle**).
 
+**Setup.** The optimizer is a sibling checkout, pinned:
+
+```bash
+git clone https://github.com/aristanetworks/purescript-backend-optimizer.git ../../purescript-backend-optimizer
+git -C ../../purescript-backend-optimizer checkout "$(head -1 ../bin/optimizer-pin)"
+```
+
+`bin/conformance.sh` and the perf canary run this lane only at the pinned
+commit, and say NOT RUN, with the reason, at any other. CI checks out the
+pin, so the lane runs there too. Moving the pin is a change to this repo,
+made in a PR that shows the lane green at the new commit.
+
 ## Why Path B
 
 The optimizer's IR (`BackendSyntax` / `NeutralExpr`) arrives with work already
