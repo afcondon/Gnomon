@@ -31,6 +31,29 @@ Two derived numbers are gated:
 does not compile per call site and grows with n exactly where specialisation
 is happening.
 
+WHY THERE IS ALSO A SPEED INDEX
+-------------------------------
+Normalising by the same run's calibration shape cancels machine speed, and it
+cancels a code-generator change that moves every shape by the same factor
+just as thoroughly: the calibration shape is compiled by the same backend.
+Pythia#3 made every closure-heavy shape about 20 % faster and the ratios saw
+nothing (REVIEW-2026-10, X3 c). So each backend also gets one number per run
+from OUTSIDE itself: the speed index, the geometric mean over the gated shapes
+of steady(backend) / steady(js) for the same shape in the same run. The JS
+reference is compiled by `purs`, which no change in this repo touches, so a
+uniform change here moves the index by its own size. The mean over many
+shapes is also far quieter than any one ratio, which is what lets its
+tolerance be tight enough to see 20 %.
+
+WHY THE BASELINE IS PER MACHINE
+-------------------------------
+"Machine-independent" turned out to be false for both numbers: the first run
+on GitHub's x86 runners put gated JS ratios at 2.17x and 0.38x of the M4
+baseline with nothing changed, and V8 and the other runtimes do not speed up
+together across CPUs. So a baseline belongs to the machine that recorded it,
+`baselines/<machine>.json`. On a machine with no baseline (every CI runner)
+the drift gate does not run, and the output says so in as many words.
+
 Checksums are compared across backends BEFORE any timing is looked at. A
 benchmark that computes the wrong answer quickly is the classic way for a
 performance suite to stay green while what it measures rots.
@@ -40,22 +63,30 @@ Usage:
     python3 run_perf.py                      # build + run + check
     python3 run_perf.py --skip-build
     python3 run_perf.py --backends js        # subset
-    python3 run_perf.py --update-baseline    # re-record (say why in the commit)
+    python3 run_perf.py --update-baseline    # re-record THIS machine's
+                                             # baseline (say why in the commit)
     python3 run_perf.py --json out.json
 """
 
 import argparse
 import json
+import math
+import os
+import platform
 import re
+import shutil
+import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-BASELINE = HERE / "baseline.json"
+BASELINES = HERE / "baselines"
 
 SCHEMA = "1"
+BASELINE_SCHEMA = "2"
 
 # The calibration shape. Everything is expressed relative to this, per
 # backend, per run. `loop-fore` is the right choice because it is the
@@ -90,6 +121,15 @@ CALIBRATION = ("loop-fore", 10000)
 # tail really looks like — six samples underestimate it.
 TOLERANCE = 2.0
 
+# How far a backend's speed index (see the header) may move, as a factor
+# either way, before the gate fires. perf/README.md has the runs behind it:
+# ten back-to-back runs (median of 3 rounds each) on the loaded Mac Mini M4,
+# Go lanes at GOMAXPROCS=1, put the worst index spread at 1.033x for psgo and
+# 1.074x for backend-go, so 1.10 sits above the noise and well inside the
+# ~20 % uniform change that Pythia#3 made and the old ratios could not see.
+# The same value as Pythia's and Jurist's, on purpose.
+INDEX_TOLERANCE = 1.10
+
 # Two filters decide whether a row is GATED (counts toward failure) or merely
 # reported. Both express the same idea: a measurement has to carry information
 # before it is allowed to fail a build.
@@ -109,6 +149,42 @@ TOLERANCE = 2.0
 # next. On a slower machine this excludes rows that would have been
 # measurable there, which loses a little coverage and never invents an alarm.
 GATE_MIN_STEADY_US = 50.0
+
+def machine_id():
+    """Who recorded a baseline: host name and CPU. A CI runner's host name is
+    fresh every run, so CI never finds a baseline, and says so."""
+    host = platform.node().split(".")[0].lower() or "unknown-host"
+    cpu = platform.processor() or platform.machine()
+    try:
+        if sys.platform == "darwin":
+            # Every Mac's node name can be plain "Mac"; the Bonjour name is
+            # the one that tells two of them apart.
+            host = subprocess.run(["scutil", "--get", "LocalHostName"],
+                                  capture_output=True, text=True).stdout.strip() or host
+            cpu = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                 capture_output=True, text=True).stdout.strip() or cpu
+        elif Path("/proc/cpuinfo").exists():
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    return re.sub(r"[^a-z0-9]+", "-", f"{host} {cpu}".lower()).strip("-")
+
+
+def baseline_path():
+    return BASELINES / f"{machine_id()}.json"
+
+
+def not_run(title, msg):
+    """A line in the log and, on GitHub Actions, a warning annotation on the
+    run, so that a gate or lane that did not run cannot be read as one that
+    passed."""
+    print(f"NOT RUN — {title}: {msg}")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning title={title} NOT RUN::{msg}")
+
 
 BENCH_RE = re.compile(
     r"^BENCH (\S+) (\d+) ([-\d.eE+]+) ([-\d.eE+]+) (-?\d+)\s*$"
@@ -172,18 +248,83 @@ JS_PATH = "./output/Bench.Main/index.js"
 
 GO_OUT = HERE / "output-go" / "Bench.Main"
 
-COMMANDS = {
-    "js": ["node", "--input-type=module", "-e",
-           f'import("{JS_PATH}").then(m => m.main())'],
-    "go": ["go", "run", "main.go", "prelude.go", "Clock_foreign.go"],
-}
-
 # `go run` compiles before it runs, but that happens at process level, outside
 # the harness's clock — so unlike Julia's per-call-site compilation it does not
 # show up in first-call timings, and f/s stays meaningful.
-CWD = {"go": GO_OUT}
+COMMANDS = {
+    "js": ["node", "--input-type=module", "-e",
+           f'import("{JS_PATH}").then(m => m.main())'],
+    "go": (["go", "run", "main.go", "prelude.go", "Clock_foreign.go"], GO_OUT),
+}
+
+# The optimizer lane runs the same corpus through backend-go
+# (purescript-backend-optimizer's IR) with its own runtime.go. It owns the TCO
+# and unboxing work, and until this lane joined the canary nothing guarded its
+# performance at all (REVIEW-2026-10, G8 and X3 d). Its command needs a staged
+# directory, so main() fills it in.
+COMMANDS["backend-go"] = None
 
 RUNNERS = list(COMMANDS)
+
+# Both Go lanes run on ONE P. The corpus is single-threaded, and on the M4 a
+# Go process with the default GOMAXPROCS lands, per process and at random, in
+# a fast or a slow mode for its first shapes: psgo's loop-null@10000 measured
+# ~187 us or ~440 us in 9 of 20 fresh processes, and backend-go's calibration
+# shape loop-fore@10000 ~400 us or ~910 us, which moved every backend-go ratio
+# by 2.2x at once. With GOMAXPROCS=1 the slow mode showed in 1 of 20 and 0 of
+# 30 processes (2026-10-27, perf/README.md). It costs psgo ~15 % on
+# allocation-heavy shapes (no parallel GC), which is fine for a canary that
+# compares the backend with itself, and it is the same setting every run.
+GO_ENV = {**os.environ, "GOMAXPROCS": "1"}
+ENV = {"go": GO_ENV, "backend-go": GO_ENV}
+
+OPTIMIZER = HERE.parent.parent / "purescript-backend-optimizer"
+BACKEND_GO = HERE.parent / "backend-go"
+
+
+def stage_backend_go():
+    """Emit Bench.Main through backend-go into a scratch directory and build
+    it, as backend-go/run_conformance.sh does. -> (command, None) or (None,
+    why). Building here keeps `go build` outside the timed process."""
+    if not OPTIMIZER.is_dir():
+        return None, (f"../{OPTIMIZER.name} is not checked out beside this "
+                      "repo, so the optimizer lane has no compiler")
+    out = Path(tempfile.mkdtemp(prefix="perf-backend-go-"))
+    # spago can rewrite the dependency ranges in spago.yaml on a build
+    # (review X7); put the tracked file back so a perf run leaves the tree as
+    # it found it.
+    config = (BACKEND_GO / "spago.yaml").read_bytes()
+    try:
+        builds = run_emit(out)
+    finally:
+        (BACKEND_GO / "spago.yaml").write_bytes(config)
+    for cmd, r in builds:
+        if r.returncode != 0:
+            sys.stderr.write(r.stdout[-2000:] + r.stderr[-2000:])
+            sys.exit(f"backend-go: {' '.join(cmd[:2])} failed ({r.returncode})")
+    shutil.copy(BACKEND_GO / "runtime.go", out / "runtime.go")
+    # backend-go looks for a co-located foreign relative to ITS cwd, where
+    # perf/'s CoreFn modulePaths do not resolve, so the corpus's one foreign
+    # is supplied here, from the same file psgo copies.
+    shutil.copy(HERE / "src" / "Bench" / "Clock.go", out / "Bench_Clock_foreign.go")
+    r = subprocess.run("go build -o bench *.go", shell=True, cwd=out,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr[-2000:])
+        sys.exit("backend-go: go build failed")
+    return ([str(out / "bench")], out), None
+
+
+def run_emit(out):
+    results = []
+    for cmd in (["spago", "build"],
+                ["spago", "run", "--", "--corefn-dir", str(HERE / "output"),
+                 "--output-dir", str(out), "--main", "Bench.Main"]):
+        r = subprocess.run(cmd, cwd=BACKEND_GO, capture_output=True, text=True)
+        results.append((cmd, r))
+        if r.returncode != 0:
+            break
+    return results
 
 # Per-backend wall clock. A shape CAN exceed any sensible timeout — fold-list
 # at n=1600 did not finish in ten minutes on Jurist — so the timeout is a
@@ -200,8 +341,10 @@ def run_backend(name, echo=False):
     on the corpus side, a timeout still yields every shape that completed —
     and WHICH shape it died on, which is the more useful half.
     """
+    cmd, cwd = COMMANDS[name] if isinstance(COMMANDS[name], tuple) \
+        else (COMMANDS[name], HERE)
     proc = subprocess.Popen(
-        COMMANDS[name], cwd=CWD.get(name, HERE), text=True,
+        cmd, cwd=cwd, text=True, env=ENV.get(name),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     lines = []
@@ -264,6 +407,25 @@ def parse(lines, who, timed_out):
     return rows
 
 
+def median_rows(rounds, who):
+    """Per shape, the median steady and first time over the rounds. A shape
+    that is DNF in any round is DNF. A checksum that differs between rounds
+    of the same backend is a nondeterministic benchmark, which is a failure."""
+    keys = set(rounds[0]).intersection(*rounds[1:])
+    out = {}
+    for key in keys:
+        sums = {r[key]["checksum"] for r in rounds}
+        if len(sums) > 1:
+            sys.exit(f"{who}: {key[0]}@{key[1]} checksum differs between "
+                     f"rounds: {sorted(sums)}")
+        out[key] = {
+            "first": statistics.median(r[key]["first"] for r in rounds),
+            "steady": statistics.median(r[key]["steady"] for r in rounds),
+            "checksum": sums.pop(),
+        }
+    return out
+
+
 def derive(rows, who):
     """Add machine-independent ratios. Returns (derived, calibration_us)."""
     cal = rows.get(CALIBRATION)
@@ -291,6 +453,35 @@ def derive(rows, who):
     return out, base
 
 
+def speed_index(results, rows_for):
+    """-> {backend: (index, [row names])}. See the header: the geometric mean
+    over gated shapes of steady(backend)/steady(js), same shape, same run.
+    `rows_for(backend)` names the shapes, so a check uses exactly the
+    baseline's set, and a shape that did not finish is reported rather than
+    silently shifting the mean."""
+    js = results.get("js")
+    out = {}
+    if js is None:
+        return out
+    for b, rows in results.items():
+        if b == "js":
+            continue
+        logs, used = [], []
+        for name in rows_for(b):
+            shape, n = name.rsplit("@", 1)
+            key = (shape, int(n))
+            if key in rows and key in js and js[key]["steady"] > 0:
+                logs.append(math.log(rows[key]["steady"] / js[key]["steady"]))
+                used.append(name)
+        if logs:
+            out[b] = (math.exp(sum(logs) / len(logs)), used)
+    return out
+
+
+def gated_names(rows):
+    return sorted(f"{k[0]}@{k[1]}" for k, v in rows.items() if v["gated"])
+
+
 # ------------------------------------------------------------------ check --
 
 def check_checksums(results):
@@ -315,6 +506,50 @@ def check_checksums(results):
             detail = ", ".join(f"{b}={v}" for b, v in sorted(vals.items()))
             divergences.append(f"{key[0]}@{key[1]}: checksums differ — {detail}")
     return divergences, unmeasured
+
+
+def check_index(results, baseline, rounds):
+    """Each backend's speed index against the baseline's. -> (lines, hard)
+
+    Each round's own index is printed too. Their spread is this run's noise,
+    measured rather than assumed: when it is wider than the tolerance, the
+    verdict is labelled NOISY, because on that run the gate cannot tell a
+    change of that size from the machine's load."""
+    lines, hard = [], 0
+    recorded = baseline.get("index", {})
+    rows_for = lambda b: recorded.get(b, {}).get("rows", [])
+    now = speed_index(results, rows_for)
+    per_round = [speed_index(r, rows_for) for r in rounds]
+    for b in sorted(results):
+        if b == "js":
+            continue
+        was = recorded.get(b)
+        if was is None:
+            lines.append(f"  {b}: no speed index in this machine's baseline")
+            hard += 1
+            continue
+        if b not in now:
+            lines.append(f"  {b}: none of the index shapes were measured")
+            hard += 1
+            continue
+        idx, used = now[b]
+        missing = sorted(set(was["rows"]) - set(used))
+        factor = idx / was["index"]
+        moved = factor > INDEX_TOLERANCE or factor < 1.0 / INDEX_TOLERANCE
+        hard += bool(moved or missing)
+        each = [r[b][0] for r in per_round if b in r]
+        spread = max(each) / min(each) if each else 1.0
+        noisy = spread > INDEX_TOLERANCE
+        lines.append(f"  {b}: speed index {was['index']:.3f} -> {idx:.3f} x js "
+                     f"[{factor:.3f}x, tolerance {INDEX_TOLERANCE}x] "
+                     f"{'MOVED' if moved else 'ok'}"
+                     + (f"; DNF on {', '.join(missing)}" if missing else ""))
+        lines.append(f"      rounds: {', '.join(f'{x:.3f}' for x in each)} "
+                     f"(spread {spread:.3f}x)"
+                     + ("  NOISY: wider than the tolerance, so this run "
+                        "cannot vouch for the verdict; re-run on a quieter "
+                        "machine" if noisy else ""))
+    return lines, hard
 
 
 def check_baseline(results, baseline):
@@ -364,6 +599,10 @@ def report(results, calibrations):
     for b in backends:
         print(f"calibration  {b}: {CALIBRATION[0]}@{CALIBRATION[1]} "
               f"= {calibrations[b]:.2f} us steady")
+    for b, (idx, used) in sorted(speed_index(
+            results, lambda b: gated_names(results[b])).items()):
+        print(f"speed index  {b}: {idx:.3f} x js (geomean over {len(used)} "
+              f"gated shapes, this run)")
     print()
 
     head = f"{'shape':<16}{'n':>7}"
@@ -408,16 +647,63 @@ def fmt_fs(x):
     return f"{x:.0f}x" if x >= 100 else f"{x:.1f}x"
 
 
-def to_baseline(results):
+# A shape whose steady time moves by more than this between ROUNDS of one run
+# (on the backend or on JS) is left out of the speed index when a baseline is
+# recorded. psgo's loop-null@10000 is the case that forced it: per process it
+# runs at ~187 us or ~440 us, about half the time each (it is the corpus's
+# first shape, so it likely catches the process before it settles). A 2.4x
+# coin flip in one of eleven shapes moves the index by 2.4^(1/11) = 1.08 on
+# its own, and no median over three rounds fixes a 50/50 split. The shape is
+# still measured, printed and ratio-gated; it just cannot vote in the index.
+# Recording at a higher --repeat makes a bimodal shape likelier to show both
+# modes while recording; the baseline here was recorded at the default.
+UNSTABLE_ROUND_SPREAD = 1.5
+
+
+def round_spread(rounds, backend, name):
+    shape, n = name.rsplit("@", 1)
+    key = (shape, int(n))
+    vals = [r[backend][key]["steady"] for r in rounds
+            if key in r.get(backend, {}) and r[backend][key]["steady"] > 0]
+    return max(vals) / min(vals) if len(vals) > 1 else 1.0
+
+
+def index_rows(results, rounds):
+    """-> (rows_for, unstable): the gated shapes that may vote in each
+    backend's index, and the ones excluded for round-to-round instability."""
+    unstable = {}
+    for b in results:
+        if b == "js":
+            continue
+        for name in gated_names(results[b]):
+            spread = max(round_spread(rounds, b, name),
+                         round_spread(rounds, "js", name))
+            if spread > UNSTABLE_ROUND_SPREAD:
+                unstable.setdefault(b, {})[name] = round(spread, 2)
+    return (lambda b: [n for n in gated_names(results[b])
+                       if n not in unstable.get(b, {})]), unstable
+
+
+def to_baseline(results, rounds=()):
+    rows_for, unstable = index_rows(results, rounds)
     return {
-        "schema": SCHEMA,
+        "schema": BASELINE_SCHEMA,
+        "machine": machine_id(),
         "calibration": {"shape": CALIBRATION[0], "n": CALIBRATION[1]},
         "tolerance": TOLERANCE,
+        "index_tolerance": INDEX_TOLERANCE,
         "gate_min_steady_us": GATE_MIN_STEADY_US,
         "note": ("Ratios, not milliseconds — see the header of run_perf.py. "
                  "`rel` is steady/steady(calibration) within the same backend "
-                 "and run; `fs` is first/steady. Both are machine-independent, "
-                 "which is what makes this baseline portable to CI."),
+                 "and run; `fs` is first/steady; `index` is the geometric mean "
+                 "of steady(backend)/steady(js) over `rows`, same run. None of "
+                 "them transfers between machines, so this file speaks only "
+                 "for the machine named in `machine`."),
+        "index": {
+            b: {"index": round(idx, 6), "rows": used,
+                "unstable": unstable.get(b, {})}
+            for b, (idx, used) in sorted(speed_index(results, rows_for).items())
+        },
         "backends": {
             b: {
                 f"{k[0]}@{k[1]}": {
@@ -438,11 +724,15 @@ def to_baseline(results):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-build", action="store_true")
-    ap.add_argument("--backends", default="js,go",
+    ap.add_argument("--backends", default="js,go,backend-go",
                     help="comma-separated subset of: " + ",".join(RUNNERS))
     ap.add_argument("--echo", action="store_true",
                     help="stream BENCH lines as they arrive (a long shape "
                          "looks like a hang otherwise)")
+    ap.add_argument("--repeat", type=int, default=3, metavar="N",
+                    help="run every backend N times, interleaved, and use the "
+                         "median per shape (default 3; the speed index's "
+                         "tolerance was set at 3)")
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--json", metavar="PATH",
                     help="write the full measurement to PATH")
@@ -460,12 +750,27 @@ def main():
     if not args.skip_build:
         build()
 
+    if "backend-go" in wanted:
+        COMMANDS["backend-go"], why = stage_backend_go()
+        if why:
+            not_run("Perf canary, backend-go lane", why)
+            wanted.remove("backend-go")
+
+    # Rounds are INTERLEAVED (js, go, backend-go, js, go, ...) rather than
+    # one backend at a time, so that a change in machine load during the run
+    # lands on the numerator and the denominator of the speed index alike.
+    measured = {b: [] for b in wanted}
+    for i in range(args.repeat):
+        for b in wanted:
+            print(f"• running {b}, round {i + 1}/{args.repeat} "
+                  f"(up to {TIMEOUT}s)...", file=sys.stderr)
+            lines, timed_out = run_backend(b, echo=args.echo)
+            measured[b].append(parse(lines, b, timed_out))
     results, calibrations = {}, {}
     for b in wanted:
-        print(f"• running {b} (up to {TIMEOUT}s)...", file=sys.stderr)
-        lines, timed_out = run_backend(b, echo=args.echo)
-        rows = parse(lines, b, timed_out)
-        results[b], calibrations[b] = derive(rows, b)
+        results[b], calibrations[b] = derive(median_rows(measured[b], b), b)
+    rounds = [{b: derive(measured[b][i], b)[0] for b in wanted}
+              for i in range(args.repeat)]
 
     report(results, calibrations)
 
@@ -486,15 +791,30 @@ def main():
         print(f"  DNF  {p}")
 
     if args.update_baseline:
-        BASELINE.write_text(json.dumps(to_baseline(results), indent=2) + "\n")
-        print(f"baseline: rewritten ({BASELINE.name}) — "
+        path = baseline_path()
+        BASELINES.mkdir(exist_ok=True)
+        path.write_text(json.dumps(to_baseline(results, rounds), indent=2) + "\n")
+        print(f"baseline: rewritten (baselines/{path.name}) — "
               "say why in the commit message")
-    elif BASELINE.exists():
-        baseline = json.loads(BASELINE.read_text())
-        if baseline.get("schema") != SCHEMA:
-            print(f"baseline: schema {baseline.get('schema')} != {SCHEMA}, "
-                  "skipping drift check")
+    elif not baseline_path().exists():
+        recorded = sorted(p.stem for p in BASELINES.glob("*.json"))
+        not_run("Perf drift gate",
+                f"no baseline recorded on this machine ({machine_id()}); "
+                f"baselines exist for: {', '.join(recorded) or 'none'}. "
+                "Drift is not checked here; checksums still gate.")
+    else:
+        baseline = json.loads(baseline_path().read_text())
+        if baseline.get("schema") != BASELINE_SCHEMA:
+            not_run("Perf drift gate",
+                    f"baselines/{baseline_path().name} has schema "
+                    f"{baseline.get('schema')}, expected {BASELINE_SCHEMA}; "
+                    "re-record it with --update-baseline")
         else:
+            print(f"baseline: baselines/{baseline_path().name}")
+            index_lines, index_hard = check_index(results, baseline, rounds)
+            print(f"SPEED INDEX (tolerance {INDEX_TOLERANCE}x either way)")
+            for line in index_lines:
+                print(line)
             drifts, n_gated = check_baseline(results, baseline)
             hard = [d for d in drifts if d[4]]
             if drifts:
@@ -504,13 +824,11 @@ def main():
                     tail = ("" if gated
                             else "  (report only — see GATE_MIN_STEADY_US)")
                     print(f"  {backend}  {name or ''}: {why}{f}{tail}")
-                if hard and args.gate_drift:
-                    failures += 1
             else:
-                print(f"baseline: no shape moved more than {TOLERANCE}x "
+                print(f"ratios: no shape moved more than {TOLERANCE}x "
                       f"({n_gated} gated rows)")
-    else:
-        print("baseline: none recorded — run with --update-baseline")
+            if (hard or index_hard) and args.gate_drift:
+                failures += 1
 
     if args.json:
         Path(args.json).write_text(json.dumps(

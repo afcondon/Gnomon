@@ -14,12 +14,13 @@ same differential-conformance method over a genuinely shared `Test.*` corpus.
 proven byte-for-byte against the JavaScript backend on the shared corpus:
 
 ```
-556/561 identical, 5 known divergences, 0 failures     ./bin/conformance.sh
+862/891 identical, 29 known divergences (values checked), 0 failures     ./bin/conformance.sh
 ```
 
-The 5 are the standing ledger (`test-suite/run_tests.py`): 2 ASTRAL, 2 INT64,
-1 STACK. Jurist and Pythia report the identical figure over the identical
-corpus, which is the method working.
+The 29 are the standing ledger (`test-suite/divergences.json`, each entry
+with both values and a cause): int32 wrap, `rem x 0`, astral characters,
+negative zero, error stacks and lone surrogates. The siblings run the same
+corpus with their own ledgers.
 
 ### And against the compiler's own test suite
 
