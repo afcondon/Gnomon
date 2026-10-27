@@ -126,10 +126,11 @@ the win through it.
   corpus, because ours only covers cases someone thought of. It is run by
   hand through the sibling `purs-corpus` harness, and **nothing gates on
   it**.
-- **Know what "CI is green" vouches for.** It covers the oracle lane and the
-  perf checksums. CI has no `purescript-backend-optimizer` checkout and no
-  machine baseline, so the optimizer lane and the perf drift gate show
-  **NOT RUN** there. Run them locally before claiming them.
+- **Know what "CI is green" vouches for.** It covers the oracle lane, the
+  optimizer lane (CI checks out `purescript-backend-optimizer` at the commit
+  in `bin/optimizer-pin`) and the perf checksums. Runners have no machine
+  baseline, so the perf drift gate shows **NOT RUN** there. Run it locally
+  before claiming it.
 - **A claim is whatever the gate says, and nothing more.** Our ADRs and
   READMEs have been wrong: an ADR claimed TCO the code didn't have, and a
   README claimed an `Int` wrap that didn't happen. Verify against the code
@@ -255,7 +256,9 @@ CI pins GHC 9.8.4 to match `lts-23.18`.
 - `patchTokens` (`src/Language/PureScript/Go/CodeGen/Pretty.hs`) rewrites identifier tokens in rendered text,
   possibly including inside string literals. User locals keep their
   PureScript names, so `_m` and `_force` can be captured.
-- The optimizer lane takes `purescript-backend-optimizer` as an unpinned
-  sibling checkout, and upstream `b8d96a9` broke it. Pin to `4810dc0` until
-  that is fixed.
+- The optimizer lane takes `purescript-backend-optimizer` as a sibling
+  checkout at the commit in `bin/optimizer-pin` (`4810dc0`; upstream
+  `b8d96a9` broke the lane). At any other commit the lane prints **NOT RUN**
+  rather than testing something unpinned. Move the pin in its own PR, with
+  the lane green at the new commit.
 
