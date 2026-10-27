@@ -93,6 +93,17 @@ jobs:
         with:
           python-version: "3.x"
 
+      # The optimizer lane (backend-go) compiles against
+      # purescript-backend-optimizer as a sibling checkout, pinned in
+      # bin/optimizer-pin. Without it the lane is NOT RUN, and CI vouched for
+      # nothing about backend-go.
+      - name: Check out the pinned backend-optimizer
+        run: |
+          git clone -q https://github.com/aristanetworks/purescript-backend-optimizer.git ../purescript-backend-optimizer
+          git -C ../purescript-backend-optimizer checkout -q "$(head -1 bin/optimizer-pin)"
+          # backend-go/run_conformance.sh is a zsh script.
+          command -v zsh >/dev/null || sudo apt-get install -y -qq zsh
+
       - name: Conformance lane
         # The perf drift gate runs only on a machine with its own baseline
         # (perf/baselines/); on a runner it reports NOT RUN by itself.
