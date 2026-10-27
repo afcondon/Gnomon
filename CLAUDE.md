@@ -212,7 +212,12 @@ work that converges them.
 **Representation:**
 - **ADTs:** tagged structs, `V{Tag string, Fields []any}`.
 - **Records and dictionaries:** `map[string]any`.
-- **Functions:** curried unary closures, applied as `f.(func(any) any)(x)`.
+- **Functions:** a function value is a curried unary closure, applied as
+  `f.(func(any) any)(x)`. A known-arity top-level function also has a plain
+  Go func, `_sat_<name>`, and a call with enough arguments goes straight to
+  it; psgo also inlines purs's JS inliner set (`runFnN`, primitive ops
+  through a known dictionary, saturated constructors)
+  ([ADR-0009](docs/design-decisions/0009-saturated-calls-and-inliner.md)).
 - **`Effect`:** a thunk, `func() any`.
 - **Statement form:** code is built as a Go AST and printed through gofmt
   ([ADR-0002](docs/design-decisions/0002-statement-form-via-go-ast.md)).
